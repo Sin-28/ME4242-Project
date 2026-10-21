@@ -32,34 +32,6 @@ Check the RGB tracking without motors or the depth SDK:
 python nus_main.py bending-preview
 ```
 
-To measure bends toward or away from the camera without motors, use the
-aligned RealSense depth stream:
-
-```bash
-python nus_main.py bending-preview --depth
-```
-
-Before trusting 3D angles, check the aligned depth of each marker:
-
-```bash
-python nus_main.py bending-preview --depth-check
-```
-
-This shows a millimeter reading beside the green tip and every blue disc.
-Move one marker toward and away from the camera: its reading should decrease
-and increase respectively while stationary markers remain steady. `--` means
-there were too few valid depth pixels on that colored disc or the readings
-disagreed. Press `s` to save the annotated view and a CSV with depth, valid
-pixel count, and depth spread in `runs/`. The 3D bending view uses these
-color-gated readings rather than nearby background depth.
-
-This uses 1280×720 aligned color/depth frames so the saved RGB setup can be
-reused. On the test Mac the SDK crashes while starting either 640×480 or
-1280×720 depth streams; the command checks this in a child process and reports
-the failure without crashing the preview process. RGB alone cannot determine
-front/back bending. Use a machine where the D405 depth stream starts normally
-to validate 3D angles.
-
 The RGB preview shows 2D angles only. The regular N-U-S commands use
 `Vision.open_camera()` from `emioapi` for depth. On the test Mac, the D405
 appeared on USB and RGB preview worked, but the RealSense SDK crashed during
@@ -82,19 +54,13 @@ each detected bend separately (`B1`, `B2`, etc.). Signed 2D angles use `+` for
 clockwise motion on screen. With valid depth at every marker, it also estimates
 unsigned 3D bend angles, including motion toward or away from the camera.
 Missing depth leaves the 2D measurement and a depth status visible. Angles are
-shown only when all ten markers are visible; held positions remain outlined
-briefly during occlusion, with angle measurement paused. After tracking loss, the overlay retries the saved
-reference pose and original marker colors automatically. The tracking area
-extends to the saved base position even if the selected ROI ended before the
-base-side blue marker. Optical flow predicts marker positions between frames so
-fast bending can move beyond the local color search window.
+shown only when the full ten-marker chain is tracked; briefly held positions
+can appear during occlusion. After tracking loss, the overlay retries the saved
+reference pose and original marker colors automatically.
 
-The initial marker ordering assumes the base is to the right of the tip in the
-image. Local tracking can follow a brief reversal in image x, but a full
-reacquisition still needs the markers to separate across the image. The
-dedicated `--depth` preview
-aligns depth to color and deprojects each marker using RealSense intrinsics.
-The regular N-U-S commands use the existing `emioapi` camera, which does not
-explicitly align depth pixels to the color image. Their bending overlay shows
-2D only until aligned depth is supplied, avoiding misleading 3D readings.
+The marker ordering assumes the base is to the right of the tip in the image
+and the rod does not fold backward in image x. 3D values use the existing
+`emioapi` camera calibration and its millimeter depth frame. The current SDK
+returns depth and color frames without explicit pixel alignment, so the 3D
+values are provisional until alignment and physical accuracy are verified.
 The repository tests use synthetic color and depth frames.
