@@ -11,12 +11,15 @@ Run inside the ME4242 conda env, with EMIO Labs closed:
     python nus_main.py goto all --dry-run  # detect and plan only, motors never move
     python nus_main.py search              # N -> U -> S in turn, timed, results saved to runs/
     python nus_main.py search --trials 5 --record   # 5 trials, saves a video of each session
+    python nus_main.py holder              # camera only: teach the holder's N, U, S slots
+    python nus_main.py retrieve --dry-run  # camera only: show the planned routes
+    python nus_main.py retrieve            # pick the letters up, trial and error, into the holder (nus_retrieve.py)
 
 Press q or Esc in the camera window at any time to stop. Stopping (or finishing)
 disables motor torque, so the arm goes slack.
 
 Steps 1-3 of the task (find letter, raise the tip, move over it, lower onto it) are covered here.
-Carrying the letter past the obstacles and placing it in the mold come next.
+Picking the letters up and placing them in the holder: `retrieve` (nus_retrieve.py).
 """
 
 import argparse
@@ -33,121 +36,9 @@ import numpy as np
 from nus_control import (MAX_TRAVEL_RAD, PULL_MAX_MM, PULLEY_RADIUS_MM, Cables, align_to_calibration, calibrate,
                          describe_model, load_calibration, lower_onto, move_tip_adaptive, move_tip_along, move_tip_to,
                          probe_model, raise_tip, reachability, reset_live_model, set_live_model, solve_pulls)
-from nus_path import densify, footprint, min_clearance, path_length, plan_path, touched
-from nus_vision import LETTERS, Vision, draw_overlay, fmt, load_config, save_config_value
-
-WINDOW = "NUS retrieval  (q / Esc = stop)"
-
-
-class Display:
-    def __init__(self, vision, recorder=None):
-        self.vision = vision
-        self.recorder = recorder
-        self.candidates, self.detections = [], {}
-        self.target_px, self.lines = None, []
-        self.target_pos, self.timer_start = None, None     # live distance + timer while moving
-        self.obstacles, self.clearance_mm = [], 0.0          # drawn as outlines (footprint + clearance)
-        self.path = None                                     # (list of (x, z), height y): planned route
-        cv2.namedWindow(WINDOW)
-
-    def _to_px(self, x, y, z):
-        p = self.vision.robot_to_pixel([x, y, z])
-        return None if p is None else tuple(int(v) for v in p)
-
-    def _draw_plan(self, image):
-        for o in self.obstacles:
-            if o["kind"] == "object" and o.get("contour") is not None:   # what the camera segmented
-                cv2.drawContours(image, [o["contour"]], -1, (0, 100, 255), 1, cv2.LINE_AA)
-            # footprint (thick) and the offset the tip keeps from it (thin), drawn where it stands
-            y = o["base_y"] if o.get("base_y") is not None else o["height_y"]
-            for offset, thickness in ((0.0, 2), (o.get("inflate", self.clearance_mm), 1)):
-                ring = [self._to_px(x, y, z) for x, z in footprint(o, offset)]
-                ring = np.array([p for p in ring if p is not None], np.int32)
-                if len(ring) > 2:
-                    cv2.polylines(image, [ring], True, (0, 165, 255), thickness, cv2.LINE_AA)
-            if o["kind"] == "object" and "height_mm" in o:
-                p = self._to_px(o["centre"][0], o["height_y"], o["centre"][1])
-                if p is not None:
-                    cv2.putText(image, f"{o['height_mm']:.0f}mm", p, cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                                (0, 165, 255), 1, cv2.LINE_AA)
-        if self.path is not None:
-            points, y = self.path
-            line = np.array([p for p in (self._to_px(x, y, z) for x, z in points) if p is not None], np.int32)
-            if len(line) > 1:
-                cv2.polylines(image, [line], False, (255, 255, 0), 2, cv2.LINE_AA)
-
-    def show(self, frame, tip=None):
-        roi = self.vision.workspace_mask(frame.shape[:2])
-        lines = list(self.lines)
-        if self.timer_start is not None:
-            lines.append(f"time {time.time() - self.timer_start:5.1f} s")
-        if self.target_pos is not None and tip is not None:
-            lines.append(f"distance to target {np.hypot(*(tip['pos'][[0, 2]] - self.target_pos[[0, 2]])):5.1f} mm")
-        image = draw_overlay(frame, self.candidates, self.detections, tip, self.target_px, lines, roi)
-        self._draw_plan(image)
-        if self.target_px is not None and tip is not None and self.path is None:
-            cv2.line(image, tuple(int(v) for v in tip["px"]), tuple(int(v) for v in self.target_px),
-                     (255, 0, 255), 1, cv2.LINE_AA)
-        if self.recorder is not None:
-            self.recorder.write(image)
-        cv2.imshow(WINDOW, image)
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), 27):
-            raise KeyboardInterrupt("stopped from the camera window")
-        return key
-
-
-class Recorder:
-    """Saves the annotated camera view as a real-time MP4 (frames are repeated or skipped to keep
-    a steady frame rate), e.g. for the project video."""
-
-    def __init__(self, path, fps=15):
-        self.path, self.fps = path, fps
-        self.writer, self.start, self.written = None, None, 0
-
-    def write(self, image):
-        if self.writer is None:
-            self.path.parent.mkdir(exist_ok=True)
-            h, w = image.shape[:2]
-            self.writer = cv2.VideoWriter(str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (w, h))
-            self.start = time.time()
-        due = int((time.time() - self.start) * self.fps) + 1
-        while self.written < due:
-            self.writer.write(image)
-            self.written += 1
-
-    def close(self):
-        if self.writer is not None:
-            self.writer.release()
-            print(f"Video saved: {self.path}")
-
-
-def open_camera_or_exit():
-    camera = Vision.open_camera()
-    if camera is None:
-        sys.exit("Could not open the camera. Close EMIO Labs and check the USB cable.")
-    return camera
-
-
-def locate_letters(vision, display, frames=15):
-    """Median position of each letter over several frames (more stable than one frame)."""
-    seen = {L: [] for L in LETTERS}
-    for _ in range(frames):
-        frame, depth = vision.grab()
-        detections, candidates = vision.detect_letters(frame, depth)
-        display.candidates, display.detections = candidates, detections
-        display.show(frame)
-        for L, d in detections.items():
-            if d["pos"] is not None:
-                seen[L].append(d)
-    found = {}
-    for L, ds in seen.items():
-        if len(ds) >= frames // 3:
-            found[L] = {"pos": np.median([d["pos"] for d in ds], axis=0),
-                        "px": np.median([d["px"] for d in ds], axis=0),
-                        "score": float(np.median([d["score"] for d in ds]))}
-    return found
-
+from nus_path import densify, min_clearance, path_length, plan_path, touched
+from nus_ui import WINDOW, Display, Recorder, locate_letters, open_camera_or_exit, stable_objects
+from nus_vision import LETTERS, Vision, fmt, load_config, save_config_value
 
 # ---------------------------------------------------------------- detect
 
@@ -348,8 +239,8 @@ RESULTS_CSV = RUNS_DIR / "search_results.csv"
 CSV_FIELDS = ["time", "trial", "letter", "success", "error_mm", "seconds", "steps", "reason",
               "target_x", "target_y", "target_z", "tip_x", "tip_y", "tip_z", "success_mm",
               "waypoints", "path_mm", "min_clearance_mm", "raised_mm", "above_letter_mm"]
-DEFAULT_LETTER_RADIUS_MM = 25.0
-STUCK_MM_PER_MM = 0.5                 # no cable moves the tip more than this per mm of cable: it's caught      # footprint used for a letter that wasn't in the last frame
+DEFAULT_LETTER_RADIUS_MM = 25.0       # footprint used for a letter that wasn't in the last frame
+STUCK_MM_PER_MM = 0.5                 # no cable moves the tip more than this per mm of cable: it's caught
 
 
 def ready_screen(vision, display, calib, tip_rest, args, trial):
@@ -413,16 +304,6 @@ def ready_screen(vision, display, calib, tip_rest, args, trial):
             return found, objects + list(letter_obstacles.values())
         if key == ord(" "):
             print("Not all letters found yet. Press f to start with: " + (", ".join(found) or "none"))
-
-
-def stable_objects(history, min_frames=3, match_mm=15.0):
-    """Objects of the latest frame that were also seen (centre within match_mm) in at least
-    min_frames of the recent frames: depth noise can make a spurious blob appear for a frame."""
-    if not history:
-        return []
-    return [o for o in history[-1]
-            if sum(any(np.linalg.norm(np.asarray(o["centre"]) - np.asarray(p["centre"])) < match_mm for p in frame)
-                   for frame in history) >= min(min_frames, len(history))]
 
 
 def save_and_summarise(rows):
@@ -796,6 +677,31 @@ def main():
     p_s.add_argument("--pull-max-mm", type=float, default=None,
                      help=f"most each cable may pull, in mm (default: the calibration's, {PULL_MAX_MM:.0f}); "
                           "more lets the arm bend further (reach further, raise the tip higher)")
+    sub.add_parser("holder", help="camera only: teach where each letter's slot in the holder is")
+    p_r = sub.add_parser("retrieve", help="pick the letters up and put them in the holder, trying other routes "
+                                          "when the tip gets stuck")
+    p_r.add_argument("--dry-run", action="store_true", help="camera only: show the plan, motors never move")
+    p_r.add_argument("--dry-run-s", type=float, default=30.0, help="how long the dry run shows the plan (default 30 s)")
+    p_r.add_argument("--no-place", action="store_true", help="only reach each letter's magnet (no holder yet)")
+    p_r.add_argument("--pull-max-mm", type=float, default=25.0, help="most each cable may pull, mm (default 25)")
+    p_r.add_argument("--success-mm", type=float, default=8.0, help="tip this close to the magnet = reached (default 8)")
+    p_r.add_argument("--route", choices=("contact", "avoid"), default="contact",
+                     help="contact (default): pass --hug-mm from objects; avoid: --clearance-mm from everything")
+    p_r.add_argument("--hug-mm", type=float, default=8.0, help="gap kept from objects with --route contact (default 8)")
+    p_r.add_argument("--clearance-mm", type=float, default=15.0, help="gap kept from the other letters (default 15)")
+    p_r.add_argument("--tip-mm", type=float, default=None,
+                     help="how far the magnet tip sticks out past the green marker (default: tip_length_mm in nus_config.json, 8)")
+    p_r.add_argument("--directions", type=int, default=8, help="approach sides tried per letter (default 8)")
+    p_r.add_argument("--stuck-s", type=float, default=3.0, help="tip hasn't moved for this long = stuck (default 3 s)")
+    p_r.add_argument("--stuck-mm", type=float, default=4.0, help="...moved less than this (default 4 mm)")
+    p_r.add_argument("--attempt-timeout-s", type=float, default=60.0, help="give up an attempt after this long (default 60 s)")
+    p_r.add_argument("--max-attempts", type=int, default=5, help="attempts per letter per round (default 5)")
+    p_r.add_argument("--place-tries", type=int, default=3, help="routes tried to the slot while carrying (default 3)")
+    p_r.add_argument("--carry-margin-mm", type=float, default=12.0,
+                     help="extra gap from obstacles while carrying a letter (default 12)")
+    p_r.add_argument("--slot-tol-mm", type=float, default=15.0, help="letter this close to its slot = placed (default 15)")
+    p_r.add_argument("--waypoint-step-mm", type=float, default=15.0, help="spacing of the route's points (default 15)")
+    p_r.add_argument("--record", action="store_true", help="save the camera view as an MP4 in runs/")
     args = parser.parse_args()
     if args.command == "calibrate" and not 1 <= args.search_mm <= 100:
         parser.error("--search-mm must be between 1 and 100")
@@ -805,8 +711,9 @@ def main():
             parser.error(f"--pull-max-mm must be between 1 and {limit:.0f} mm of cable")
 
     cfg = load_config()
+    from nus_retrieve import cmd_holder, cmd_retrieve
     commands = {"check": cmd_check, "detect": cmd_detect, "jog": cmd_jog, "calibrate": cmd_calibrate,
-                "goto": cmd_goto, "search": cmd_search}
+                "goto": cmd_goto, "search": cmd_search, "holder": cmd_holder, "retrieve": cmd_retrieve}
     commands[args.command](cfg, args)
 
 

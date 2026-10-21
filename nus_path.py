@@ -186,3 +186,73 @@ def min_clearance(points, obstacles):
     if not obstacles or len(points) < 2:
         return math.inf
     return min(segment_distance(a, b, footprint(o)) for o in obstacles for a, b in zip(points, points[1:]))
+
+
+def ray_exit(point, direction, poly):
+    """Distance from a point inside a convex polygon to its boundary along `direction` (unit)."""
+    p, u = np.asarray(point, float), np.asarray(direction, float)
+    best = math.inf
+    for a, b in zip(poly, np.roll(poly, -1, axis=0)):
+        e, w = b - a, a - p
+        det = e[0] * u[1] - u[0] * e[1]           # p + t u = a + s e
+        if abs(det) < 1e-12:
+            continue
+        t = (e[0] * w[1] - w[0] * e[1]) / det
+        s = (u[0] * w[1] - w[0] * u[1]) / det
+        if t > 0 and -1e-9 <= s <= 1 + 1e-9:
+            best = min(best, t)
+    return 0.0 if best == math.inf else float(best)
+
+
+def support_of(goal, obstacles):
+    """The obstacle the goal stands on: the smallest footprint containing it (None if there's none)."""
+    under = [o for o in obstacles if inside(goal, footprint(o))]
+    return min(under, key=lambda o: abs(_area(footprint(o))), default=None)
+
+
+def _area(poly):
+    x, y = poly[:, 0], poly[:, 1]
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def approach_routes(start, goal, obstacles, support=None, axis=None, clearance_mm=15.0, standoff_mm=12.0,
+                    directions=8, reachable=None, failed_angles=(), failed_within_deg=30.0, inner_penalty=1.5):
+    """Candidate routes to a goal, one per approach side (directions sides around it).
+    support: the obstacle the goal lies on (a block, the holder) or None. Each route is the shortest
+    path around `obstacles` and the support to a point just outside the support on that side
+    (standoff_mm beyond its grown footprint; around the goal itself without a support), then straight
+    in to the goal, crossing only the support's edge.
+    cost = length + inner_penalty * how much closer to `axis` (the arm's middle) the approach point
+    is than the goal: a bent arm's tip is higher the further out it reaches, so it gets onto a block
+    more easily from the side facing away from the middle.
+    failed_angles: sides that already failed; sides within failed_within_deg of them are skipped.
+    reachable(point) -> bool: drop approach points the cables can't get to.
+    Returns [{"path", "approach", "angle_deg", "cost", "length"}], cheapest first."""
+    start, goal = np.asarray(start, float), np.asarray(goal, float)
+    axis = start if axis is None else np.asarray(axis, float)
+    blocking = list(obstacles) + ([support] if support is not None else [])
+    zones = [footprint(o, o.get("inflate", clearance_mm)) for o in obstacles]
+    # the last leg goes straight in: it may pass closer than the full offset, but not over anything
+    near_zones = [footprint(o, 0.5 * o.get("inflate", clearance_mm)) for o in obstacles]
+    support_zone = footprint(support, support.get("inflate", 0.0)) if support is not None else None
+    r_goal = float(np.linalg.norm(goal - axis))
+    routes = []
+    for k in range(directions):
+        angle = 360.0 * k / directions
+        if any(abs((angle - a + 180.0) % 360.0 - 180.0) < failed_within_deg for a in failed_angles):
+            continue
+        u = np.array([math.cos(math.radians(angle)), math.sin(math.radians(angle))])
+        out = ray_exit(goal, u, support_zone) if support_zone is not None and inside(goal, support_zone) else 0.0
+        approach = goal + u * (out + standoff_mm)
+        if any(inside(approach, z) for z in zones) or (reachable is not None and not reachable(approach)):
+            continue
+        if any(segment_hits(approach, goal, z) for z in near_zones):
+            continue                               # the last leg would cross another obstacle
+        path = plan_path(start, approach, blocking, clearance_mm)
+        if path is None:
+            continue
+        path = list(path) + [goal]
+        length = path_length(path)
+        cost = length + inner_penalty * max(0.0, r_goal - float(np.linalg.norm(approach - axis)))
+        routes.append({"path": path, "approach": approach, "angle_deg": angle, "cost": cost, "length": length})
+    return sorted(routes, key=lambda r: r["cost"])

@@ -52,6 +52,8 @@ DEFAULT_CONFIG = {
                                      #   it is on the arm (letters lie flat, at any height: platform or a block)
     "color_max_spread_mm": 7.0,      # colour mode: a letter is flat; a blob spanning more heights is an object's side
     "letter_thickness_mm": 5.0,
+    "tip_length_mm": 8.0,            # the magnet tip sticks out this far past the green marker the camera tracks
+    "holder_slots": {},              # robot (x, y, z) of each letter's slot in the holder: `python nus_main.py holder`
     "obstacle_height_mm": 8.0,       # anything (any colour) standing this high above the work surface is an
                                      #   obstacle: depth camera, above the letters' thickness + depth noise
     "obstacle_max_height_mm": 150.0, # ...unless part of it reaches higher: then it's a hand or the robot
@@ -680,13 +682,15 @@ class Vision:
                     arm = (off_line < cfg["arm_radius_mm"]) & (points[..., 1] > tip_pos[1] - 12.0)
                 # + a few pixels around it: depth at the edges of the arm's disks is a mix of disk and background
                 tall &= cv2.dilate(arm.astype(np.uint8), np.ones((9, 9), np.uint8)) == 0
-            letter_mask = np.zeros(tall.shape, np.uint8)
-            for d in letters:
-                cv2.drawContours(letter_mask, [d["contour"]], -1, 255, -1)
-            tall &= cv2.dilate(letter_mask, np.ones((9, 9), np.uint8)) == 0
+            # letters are NOT cut out: one lying on the platform is lower than obstacle_height_mm anyway,
+            # and one lying on a block is part of that block's top (cutting it out splits the block)
             # grey/white and coloured things are grouped separately: a (shaded) white block next to a
             # coloured obstacle (touching in the image, at the same height where they meet) stays two
             white = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[..., 1] <= cfg["obstacle_grey_max_saturation"]
+            letter_mask = np.zeros(tall.shape, np.uint8)       # a (coloured) letter on a block joins that block
+            for d in letters:
+                cv2.drawContours(letter_mask, [d["contour"]], -1, 255, -1)
+            white |= cv2.dilate(letter_mask, np.ones((7, 7), np.uint8)) > 0
             roi = self.workspace_mask(tall.shape) > 0
             blobs = []
             for part in (tall & white, tall & ~white):

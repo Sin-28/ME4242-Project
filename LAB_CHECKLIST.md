@@ -99,6 +99,33 @@ obstacle for the other letters, and is ignored when going to that letter.
 Results: `runs/search_results.csv` (one row per letter + one "ALL" row per trial, incl.
 raised_mm and above_letter_mm = tip height above the letter at the end) and `runs/search_*.mp4`.
 
+## 5. Retrieve: pick the letters up and put them in the holder (trial and error)
+Teach the holder once per set-up (camera only): put the holder in place, then
+```
+python nus_main.py holder
+```
+click the middle of each slot (where that letter's magnet ends up) and press n / u / s; q saves.
+Check the plan without moving (camera only), then run it:
+```
+python nus_main.py retrieve --dry-run                one look at the plan (30 s, then it stops)
+python nus_main.py retrieve --record                 the real thing, with a video in runs/
+python nus_main.py retrieve --no-place               holder not ready: only reach each magnet
+```
+What it does, until all three letters are in their slots (q in the window or Ctrl+C stops it):
+1. scans the letters (their magnets) and the obstacles;
+2. plans, for every letter, one route per side of the block it lies on (8 sides): around the
+   obstacles (grown by the magnet tip's length, `tip_length_mm` = 8 in nus_config.json, or
+   `--tip-mm`) to just outside that side, then straight in. Sides away from the middle are
+   preferred (the tip is higher there). Cyan = route it takes, grey = the alternatives,
+   coloured dots = approach points. The cheapest letter goes first;
+3. drives it; if the tip doesn't move for `--stuck-s` 3 s (caught), or doesn't get there, the
+   cables are let go (tip back to the middle), that side is marked failed, and it rescans and
+   tries the next route (up to `--max-attempts` 5 per letter, then one more round of all sides);
+4. at the magnet: lines up to 4 mm, touches it, backs off and checks the letter came along
+   (it's gone from where it lay); carries it to its slot the same way, puts it down, goes back to
+   the middle and checks the letter is in the slot (`--slot-tol-mm` 15).
+Every attempt is logged in `runs/retrieve_log.csv` (letter, side, stage, result, reason).
+
 ## If something goes wrong
 | Message | Do this |
 |---|---|
@@ -113,6 +140,9 @@ raised_mm and above_letter_mm = tip height above the letter at the end) and `run
 | The tip is far off-centre | Arm not hanging freely, or something green near the robot |
 | Letter "not found" / OUT OF REACH | Move it closer to the centre (inside the circle), teach it (step 3) |
 | Letters detected in the wrong place | `stage_y_mm` in `nus_config.json` must match the surface height (-290 bare platform, about -228 raised) |
+| `retrieve`: "No route left to try" | Every side failed twice: move the letter or the obstacle, or try `--route avoid` |
+| `retrieve`: tip keeps getting caught on a block's edge | Raise `--tip-mm` (more clearance), or lower that block |
+| `retrieve`: "letter didn't come along" | The magnet didn't take it: check the tip's magnet; `--success-mm 5` lines up closer |
 | An obstacle isn't outlined | Click on it in `detect`: if it prints less than 8 mm above the surface, lower `obstacle_height_mm`; "no depth reading" = shiny/black top, put tape on it |
 | Outlines on the platform / noise | Raise `obstacle_height_mm` (e.g. 12) |
 | Part of the arm is outlined | It must touch the tip or reach up to the robot to be left out: tell me, or move the arm clear when starting |

@@ -352,26 +352,30 @@ def reachability(calib, tip_rest, tol_mm=6.0):
 
 
 def move_tip_along(cables, vision, waypoints, target, on_frame, tol_mm=4.0, waypoint_tol_mm=8.0,
-                   adapt=False, hold_y=None, y_weight=0.15, log=print):
+                   adapt=False, hold_y=None, y_weight=0.15, watch=None, log=print):
     """Follow a planned path: each (x, z) waypoint with a loose tolerance, then `target` (robot
     frame) with tol_mm. adapt=True learns the cable model as the arm moves (needed in contact).
     hold_y (adaptive only): also try to keep the tip at this height along the way (raised over the
     letters). It is only a weak extra goal (y_weight): 1 mm of sideways error counts as much as
     1/y_weight mm of height, so it never pulls the tip off the way to the letter.
+    watch (adaptive only): see move_tip_adaptive; a "stuck" waypoint ends the whole route.
     Returns move_tip_to's result for the final target, plus "waypoints"."""
     quiet = lambda *a, **k: None
     extra = {"hold_y": hold_y, "y_weight": y_weight} if adapt and hold_y is not None else {}
+    if adapt and watch is not None:
+        extra["watch"] = watch
     move = move_tip_adaptive if adapt else move_tip_to
     for x, z in waypoints[:-1]:
         step = move(cables, vision, np.array([x, target[1], z]), on_frame,
                     tol_mm=waypoint_tol_mm, max_iter=8, log=quiet, **extra)
-        if step["reason"] == "lost the tip":
+        if step["reason"] in ("lost the tip", "stuck"):
             return {**step, "waypoints": len(waypoints)}
     return {**move(cables, vision, target, on_frame, tol_mm=tol_mm, log=log, **extra), "waypoints": len(waypoints)}
 
 
 def move_tip_adaptive(cables, vision, target, on_frame, tol_mm=4.0, gain=0.7, max_iter=30,
-                      max_step_mm=3.0, learn_rate=0.5, hold_y=None, y_weight=1.0, y_tol_mm=None, log=print):
+                      max_step_mm=3.0, learn_rate=0.5, hold_y=None, y_weight=1.0, y_tol_mm=None, watch=None,
+                      log=print):
     """Closed loop with a cable model that is corrected after every move (Broyden update).
     When the arm lies against an obstacle, the obstacle changes how each cable moves the tip, so
     the calibrated model is wrong; each measured move fixes the model in the direction just tried:
@@ -379,7 +383,8 @@ def move_tip_adaptive(cables, vision, target, on_frame, tol_mm=4.0, gain=0.7, ma
     The learned 3x4 model (x, y, z) is kept in cables.live_J (reset with reset_live_model).
     hold_y: also steer the tip's height toward hold_y (robot y, mm), weighted by y_weight against
     the sideways error, e.g. to keep it raised while it travels. Reached = sideways error < tol_mm
-    (and, with y_tol_mm, height within y_tol_mm of hold_y). Same result dict as move_tip_to."""
+    (and, with y_tol_mm, height within y_tol_mm of hold_y). watch(tip) -> True stops the move with
+    reason "stuck" (called after every measured step, e.g. a Watchdog). Same result dict as move_tip_to."""
     if getattr(cables, "live_J", None) is None:
         reset_live_model(cables)
     J = cables.live_J
@@ -430,6 +435,8 @@ def move_tip_adaptive(cables, vision, target, on_frame, tol_mm=4.0, gain=0.7, ma
         err, e_new = errors(tip)
         log(f"  step {it:2d}: error {e_new:5.1f} mm | pulls {np.round(cables.pulls, 1)} mm | "
             f"tip {tip['pos'][1] - target[1]:+.0f} mm above target")
+        if watch is not None and watch(tip):
+            return result(False, e_new, it, tip, "stuck")
         progress = float(np.linalg.norm(w * err))
         if progress < best - 0.5:
             best, stalled = progress, 0
@@ -439,6 +446,28 @@ def move_tip_adaptive(cables, vision, target, on_frame, tol_mm=4.0, gain=0.7, ma
                 return result(False, e_new, it, tip, "out of reach")
     err, e = errors(tip)
     return result(done(err, e), e, max_iter, tip, "reached" if done(err, e) else "step limit")
+
+
+class Watchdog:
+    """Tells a move to give up: the tip has stayed within stuck_mm (sideways) for stuck_s seconds
+    while being driven (caught on something), or the whole attempt took longer than timeout_s."""
+
+    def __init__(self, stuck_s=3.0, stuck_mm=4.0, timeout_s=60.0):
+        self.stuck_s, self.stuck_mm, self.timeout_s = stuck_s, stuck_mm, timeout_s
+        self.start, self.history, self.why = time.time(), [], None
+
+    def __call__(self, tip):
+        now = time.time()
+        self.history.append((now, tip["pos"][[0, 2]].copy()))
+        if now - self.start > self.timeout_s:
+            self.why = f"took longer than {self.timeout_s:.0f} s"
+            return True
+        recent = [p for t, p in self.history if now - t <= self.stuck_s]
+        covered = now - min(t for t, _ in self.history if now - t <= self.stuck_s) if recent else 0.0
+        if covered >= 0.8 * self.stuck_s and len(recent) >= 3 and                 max(np.linalg.norm(p - recent[-1]) for p in recent) < self.stuck_mm:
+            self.why = f"tip stayed within {self.stuck_mm:.0f} mm for {self.stuck_s:.0f} s"
+            return True
+        return False
 
 
 def reset_live_model(cables):
