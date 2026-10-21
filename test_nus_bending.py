@@ -6,8 +6,8 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from nus_bending import (BendingOverlay, follow_markers, load_settings, marker_chain, save_settings,
-                         spatial_angles, split_two_bends, turning_angles)
+from nus_bending import (BendingOverlay, bend_sections, follow_markers, load_settings, marker_chain,
+                         save_settings, spatial_angles, spatial_points, split_two_bends, turning_angles)
 
 
 class BendingTests(unittest.TestCase):
@@ -101,6 +101,35 @@ class BendingTests(unittest.TestCase):
         self.assertTrue(all(point is not None for point in detected))
         self.assertAlmostEqual(detected[0][0], centers[0][0], delta=2)
         self.assertAlmostEqual(detected[0][1], centers[0][1], delta=2)
+
+    def test_reacquires_saved_pose_after_stale_hue_and_tracking_loss(self):
+        frame, settings = self.frame_and_settings()
+        reference, _ = marker_chain(frame, settings)
+        settings["reference_points"] = reference
+        overlay = BendingOverlay(True)
+        overlay.settings = settings
+        overlay.shape = frame.shape[:2]
+        overlay.hue_offset = 24
+        points, status = overlay._recover(frame)
+        self.assertEqual(len(points), 10, status)
+        self.assertIsNotNone(overlay.last_points)
+
+    def test_three_bends_and_out_of_plane_depth(self):
+        headings = np.radians([0, 0, 15, 30, 15, 0, 0, 15, 30, 30])
+        xy = [(0., 0.)]
+        for angle in headings:
+            xy.append(tuple(np.asarray(xy[-1]) + 25*np.array([np.cos(angle), np.sin(angle)])))
+        self.assertEqual(len(bend_sections(xy)), 3)
+        xyz = [(float(i*25), 0., float(1200 + 90*np.sin(i*np.pi/5))) for i in range(11)]
+        self.assertGreaterEqual(len(bend_sections(xyz, min_bend=8)), 1)
+        depth = np.full((100, 350), 1200, np.uint16)
+        points = [(i*25+20, 50) for i in range(11)]
+        for i, point in enumerate(points):
+            cv2.circle(depth, point, 8, int(xyz[i][2]), -1)
+        recovered, message = spatial_points(points, depth,
+                                            lambda x, y, z: (x-20, y-50, z))
+        self.assertIn("3D", message)
+        self.assertGreaterEqual(len(bend_sections(recovered, min_bend=8)), 1)
 
 
 if __name__ == "__main__":

@@ -32,11 +32,11 @@ Check the RGB tracking without motors or the depth SDK:
 python nus_main.py bending-preview
 ```
 
-The RGB preview shows 2D angles only. The regular N-U-S commands still use
-`Vision.open_camera()` from `emioapi` for aligned depth. On the test Mac, the
-D405 appeared on USB and RGB preview worked, but opening this `emioapi` depth
-camera crashed its process. The integrated 3D overlay therefore still needs
-a successful depth-camera startup before it can be validated live.
+The RGB preview shows 2D angles only. The regular N-U-S commands use
+`Vision.open_camera()` from `emioapi` for depth. On the test Mac, the D405
+appeared on USB and RGB preview worked, but the RealSense SDK crashed during
+device enumeration. The integrated 3D overlay needs a successful depth-camera
+startup before it can be validated live.
 
 Append `--bending` to any existing command, for example:
 
@@ -48,14 +48,19 @@ python nus_main.py search --bending --record
 During any camera session, press `v` to toggle the overlay. Without
 `--bending`, it starts off. The existing `q` / Esc stop keys still work.
 
-The overlay shows signed 2D angles (`+` is clockwise on screen). When depth is
-available at the base and all visible discs, it also shows unsigned 3D angles.
-For two opposite bends, it displays base-side and tip-side angles separately.
-If depth is missing, the 2D measurement remains visible with a depth status.
-If fewer than seven colored discs are found, no angle is reported.
+The overlay draws a numbered blue ring around each intermediate marker, a green
+ring around the tip, a red base ring, and a yellow connecting line. It shows
+each detected bend separately (`B1`, `B2`, etc.). Signed 2D angles use `+` for
+clockwise motion on screen. With valid depth at every marker, it also estimates
+unsigned 3D bend angles, including motion toward or away from the camera.
+Missing depth leaves the 2D measurement and a depth status visible. Angles are
+shown only when the full ten-marker chain is tracked; briefly held positions
+can appear during occlusion. After tracking loss, the overlay retries the saved
+reference pose and original marker colors automatically.
 
 The marker ordering assumes the base is to the right of the tip in the image
 and the rod does not fold backward in image x. 3D values use the existing
-`emioapi` camera calibration and its millimeter depth frame. Live accuracy
-needs checking with the physical camera and marker arrangement; the repository
-tests use synthetic color and depth frames because hardware was unavailable.
+`emioapi` camera calibration and its millimeter depth frame. The current SDK
+returns depth and color frames without explicit pixel alignment, so the 3D
+values are provisional until alignment and physical accuracy are verified.
+The repository tests use synthetic color and depth frames.

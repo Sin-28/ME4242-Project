@@ -189,6 +189,61 @@ def split_two_bends(turns, min_bend=15.0):
     return None if best is None else best[1:]
 
 
+def bend_sections(points, min_bend=15.0):
+    """Return independent bends as (first marker, last marker, angle).
+
+    Adjacent turns in the same direction belong to one bend. A reversal starts
+    another section; small color/depth jitter is ignored.
+    """
+    vectors = np.diff(np.asarray(points, float), axis=0)
+    lengths = np.linalg.norm(vectors, axis=1)
+    if len(vectors) < 2 or np.any(lengths < 3):
+        return []
+    unit = vectors / lengths[:, None]
+    if unit.shape[1] == 2:
+        turns = np.degrees(np.arctan2(unit[:-1, 0]*unit[1:, 1]-unit[:-1, 1]*unit[1:, 0],
+                                     np.sum(unit[:-1]*unit[1:], axis=1)))
+        directions = np.sign(turns)
+        magnitudes = np.abs(turns)
+    else:
+        crosses = np.cross(unit[:-1], unit[1:])
+        magnitudes = np.degrees(np.arctan2(np.linalg.norm(crosses, axis=1),
+                                           np.sum(unit[:-1]*unit[1:], axis=1)))
+        directions = crosses / np.maximum(np.linalg.norm(crosses, axis=1)[:, None], 1e-9)
+    groups = []
+    for index, magnitude in enumerate(magnitudes):
+        if magnitude < 2.5:
+            continue
+        direction = directions[index]
+        same = bool(groups) and (directions[groups[-1][-1]]*direction > 0
+                                 if unit.shape[1] == 2 else
+                                 np.dot(directions[groups[-1][-1]], direction) > .35)
+        if same and index-groups[-1][-1] <= 2:
+            groups[-1].append(index)
+        else:
+            groups.append([index])
+    sections = []
+    for group in groups:
+        angle = float(np.sum(magnitudes[group]))
+        if angle >= min_bend:
+            sign = float(directions[group[0]]) if unit.shape[1] == 2 else 1.0
+            sections.append((group[0], group[-1]+2, sign*angle))
+    return sections
+
+
+def spatial_points(points, depth, pixel_to_robot):
+    if depth is None or depth.ndim != 2 or pixel_to_robot is None:
+        return None, "depth unavailable"
+    xyz = []
+    for x, y in points:
+        value = depth_at(depth, (x, y))
+        xyz.append(None if value is None else np.asarray(pixel_to_robot(x, y, value), float))
+    valid = sum(point is not None and np.all(np.isfinite(point)) for point in xyz)
+    if valid != len(points):
+        return None, f"depth {valid}/{len(points)}; showing 2D"
+    return np.asarray(xyz), "3D depth ready"
+
+
 def depth_at(depth, point):
     x, y = (int(round(v)) for v in point)
     height, width = depth.shape
@@ -245,6 +300,30 @@ class BendingOverlay:
         self.last_points = None
         self.missed = None
         self.hue_offset = 0
+
+    def _recover(self, frame):
+        """Retry the saved straight pose and the original hue after tracking loss."""
+        reference = self.settings.get("reference_points")
+        if reference is not None:
+            previous = np.asarray(reference, float)
+            for offset in (self.hue_offset, 0, 10, -10, 20, -20):
+                found = follow_markers(frame, self.settings, previous, offset)
+                if all(point is not None for point in found):
+                    self.last_points = np.asarray(found, float)
+                    self.missed = np.zeros(MARKER_COUNT, int)
+                    self.hue_offset = offset
+                    return self.last_points.copy(), "10/10 reacquired"
+        best, status = [], "markers 0/10"
+        for offset in dict.fromkeys((self.hue_offset, 0, 5, -5, 10, -10, 15, -15, 20, -20)):
+            candidate, candidate_status = marker_chain(frame, self.settings, None, offset)
+            if len(candidate) > len(best):
+                best, status = candidate, candidate_status
+            if len(candidate) == MARKER_COUNT:
+                self.last_points = np.asarray(candidate, float)
+                self.missed = np.zeros(MARKER_COUNT, int)
+                self.hue_offset = offset
+                return self.last_points.copy(), "10/10 reacquired"
+        return None, status
 
     def _current_hue_offset(self, frame):
         """Sample known blue discs so camera auto exposure cannot stale the saved hue."""
@@ -328,16 +407,11 @@ class BendingOverlay:
             detected = follow_markers(frame, self.settings, self.last_points, offset)
             detection_status = f"local {sum(p is not None for p in detected)}/10"
             points, status = self._stable_indexed(detected)
+            if points is None:
+                points, status = self._recover(frame)
         else:
-            detected, detection_status = [], "markers 0/10"
-            for candidate_offset in (offset, offset+10, offset-10):
-                candidate, candidate_status = marker_chain(frame, self.settings, None, candidate_offset)
-                if len(candidate) > len(detected):
-                    detected, detection_status = candidate, candidate_status
-                    self.hue_offset = candidate_offset
-                if len(candidate) == MARKER_COUNT:
-                    break
-            points, status = self._stable_points(detected)
+            points, status = self._recover(frame)
+            detection_status = status
         if points is None:
             self._text(image, "Bending: " + status + " (" + detection_status + ")", 0)
             return image
@@ -351,14 +425,26 @@ class BendingOverlay:
         except ValueError as exc:
             self._text(image, "Bending: " + str(exc), 0)
             return image
-        bend = split_two_bends(turns)
-        two_d = (f"2D base {bend[1]:+.1f} | tip {bend[2]:+.1f} deg" if bend
-                 else f"2D bend {turns.sum():+.1f} deg")
+        sections_2d = bend_sections(ordered)
+        two_d = ("2D " + (" | ".join(f"B{i} {angle:+.1f} deg" for i, (_, _, angle)
+                                    in enumerate(sections_2d, 1)) if sections_2d else "straight"))
         converter = vision.pixel_to_robot if vision is not None else None
-        _three_d, depth_status = spatial_angles(ordered, bend, depth, converter)
-        cv2.polylines(image, [np.asarray(ordered, np.int32)], False, (255, 255, 255), 2)
-        for point in ordered[1:]:
-            cv2.circle(image, tuple(map(int, point)), 4, (0, 255, 255), -1)
+        xyz, depth_status = spatial_points(ordered, depth, converter)
+        if xyz is not None:
+            sections_3d = bend_sections(xyz)
+            depth_status = ("3D " + (" | ".join(f"B{i} {angle:.1f} deg" for i, (_, _, angle)
+                                             in enumerate(sections_3d, 1)) if sections_3d else "straight"))
+        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 0, 0), 6)
+        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 255, 255), 3)
+        cv2.circle(image, tuple(map(int, base)), 12, (0, 0, 255), 3)
+        for index, point in enumerate(ordered[1:], 1):
+            center = tuple(map(int, point))
+            color = (0, 255, 0) if index == MARKER_COUNT else (255, 100, 0)
+            cv2.circle(image, center, 13, (0, 0, 0), 6)
+            cv2.circle(image, center, 13, color, 4)
+            cv2.putText(image, "T" if index == MARKER_COUNT else str(index),
+                        (center[0]+11, center[1]-10), cv2.FONT_HERSHEY_SIMPLEX, .45,
+                        color, 2)
         self._text(image, f"Bending: {status} | {two_d}", 0)
         self._text(image, depth_status, 1)
         return image
