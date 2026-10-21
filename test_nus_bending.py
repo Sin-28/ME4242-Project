@@ -6,9 +6,9 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from nus_bending import (BendingOverlay, bend_sections, follow_markers, load_settings, marker_chain,
-                         save_settings, spatial_angles, spatial_points, split_two_bends, turning_angles,
-                         valid_chain)
+from nus_bending import (BendingOverlay, bend_sections, follow_markers, load_settings,
+                         marker_chain, marker_depth_readings, save_settings, spatial_angles,
+                         spatial_points, split_two_bends, turning_angles, valid_chain)
 
 
 class BendingTests(unittest.TestCase):
@@ -183,6 +183,38 @@ class BendingTests(unittest.TestCase):
             overlay.draw(shifted.copy(), shifted, None, None)
         self.assertTrue(np.all(overlay.missed == 0))
         self.assertGreater(np.mean(overlay.last_points[:, 1]-np.asarray(points)[:, 1]), 38)
+
+    def test_depth_check_reads_each_colored_disc_and_rejects_background(self):
+        frame, settings = self.frame_and_settings()
+        points, _ = marker_chain(frame, settings)
+        depth = np.full(frame.shape[:2], 1500, np.uint16)
+        for point in points:
+            cv2.circle(depth, tuple(map(round, point)), 14, 800, -1)
+        cv2.circle(depth, tuple(map(round, points[0])), 14, 700, -1)
+        readings = marker_depth_readings(frame, depth, settings, points)
+        self.assertEqual(len(readings), 10)
+        self.assertAlmostEqual(readings[0]["mm"], 700, delta=2)
+        self.assertTrue(all(abs(item["mm"]-800) < 2 for item in readings[1:]))
+        cv2.circle(depth, tuple(map(round, points[0])), 14, 0, -1)
+        readings = marker_depth_readings(frame, depth, settings, points)
+        self.assertIsNone(readings[0]["mm"])
+        self.assertIsNone(marker_depth_readings(frame, depth[:100], settings, points))
+
+    def test_depth_check_overlay_exposes_marker_readings(self):
+        frame, settings = self.frame_and_settings()
+        points, _ = marker_chain(frame, settings)
+        settings["reference_points"] = points
+        depth = np.full(frame.shape[:2], 1000, np.uint16)
+        camera = type("AlignedCamera", (), {"aligned_depth": True})()
+        overlay = BendingOverlay(True, depth_check=True)
+        overlay.settings = settings
+        overlay.shape = frame.shape[:2]
+        overlay.last_points = np.asarray(points, float)
+        overlay.missed = np.zeros(10, int)
+        output = frame.copy()
+        overlay.draw(output, frame, depth, camera)
+        self.assertEqual(len(overlay.last_depth_readings), 10)
+        self.assertTrue(all(item["mm"] == 1000 for item in overlay.last_depth_readings))
 
 
 if __name__ == "__main__":

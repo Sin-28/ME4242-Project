@@ -4,6 +4,8 @@ import json
 import math
 import subprocess
 import sys
+import csv
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -281,12 +283,43 @@ def bend_sections(points, min_bend=15.0):
     return sections
 
 
-def spatial_points(points, depth, pixel_to_robot):
+def marker_depth_readings(frame, depth, settings, points, hue_offset=0):
+    """Read aligned depth only on colored disc pixels, never on background."""
+    if depth is None or depth.ndim != 2 or depth.shape != frame.shape[:2]:
+        return None
+    roi = tracking_roi(settings, frame.shape)
+    masks = []
+    for key, tolerance in (("green_hsv", 9), ("blue_hsv", 13)):
+        target = settings[key]
+        masks.append(color_mask(frame, ((target[0]+hue_offset) % 180, *target[1:]),
+                                tolerance, roi))
+    readings = []
+    height, width = depth.shape
+    for index, (x, y) in enumerate(points):
+        x, y = int(round(x)), int(round(y))
+        radius = 12
+        x0, x1 = max(0, x-radius), min(width, x+radius+1)
+        y0, y1 = max(0, y-radius), min(height, y+radius+1)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        disk = (xx-x)**2+(yy-y)**2 <= radius**2
+        colored = disk & (masks[0 if index == 0 else 1][y0:y1, x0:x1] != 0)
+        values = depth[y0:y1, x0:x1][colored]
+        values = values[(values >= 50) & (values <= 3000)]
+        spread = (float(np.percentile(values, 75)-np.percentile(values, 25))
+                  if len(values) else None)
+        good = len(values) >= 8 and len(values) >= .2*int(colored.sum()) and spread <= 80
+        readings.append({"mm": float(np.median(values)) if good else None,
+                         "valid": int(len(values)), "colored": int(colored.sum()),
+                         "spread": spread})
+    return readings
+
+
+def spatial_points(points, depth, pixel_to_robot, readings=None):
     if depth is None or depth.ndim != 2 or pixel_to_robot is None:
         return None, "depth unavailable"
     xyz = []
-    for x, y in points:
-        value = depth_at(depth, (x, y))
+    for index, (x, y) in enumerate(points):
+        value = readings[index]["mm"] if readings is not None else depth_at(depth, (x, y))
         xyz.append(None if value is None else np.asarray(pixel_to_robot(x, y, value), float))
     valid = sum(point is not None and np.all(np.isfinite(point)) for point in xyz)
     if valid != len(points):
@@ -343,14 +376,16 @@ def spatial_angles(points, bend, depth, pixel_to_robot):
 
 
 class BendingOverlay:
-    def __init__(self, enabled=False):
+    def __init__(self, enabled=False, depth_check=False):
         self.enabled = enabled
+        self.depth_check = depth_check
         self.settings = None
         self.shape = None
         self.last_points = None
         self.missed = None
         self.hue_offset = 0
         self.prev_gray = None
+        self.last_depth_readings = None
 
     def _recover(self, frame):
         """Retry the saved straight pose and the original hue after tracking loss."""
@@ -484,6 +519,24 @@ class BendingOverlay:
         base = effective_base(self.settings, points)
         ordered = [base] + list(points[::-1])
         self._draw_chain(image, ordered)
+        aligned_depth = bool(getattr(vision, "aligned_depth", False))
+        readings = (marker_depth_readings(frame, depth, self.settings, points, offset)
+                    if aligned_depth else None)
+        self.last_depth_readings = readings
+        if self.depth_check:
+            if readings is None:
+                self._text(image, "Depth check: no aligned depth frame", 0)
+            else:
+                for index, (point, reading) in enumerate(zip(points, readings)):
+                    label = ("TIP" if index == 0 else f"B{MARKER_COUNT-index}")
+                    value = (f"{reading['mm']:.0f}mm" if reading["mm"] is not None
+                             else f"-- ({reading['valid']}/{reading['colored']})")
+                    xy = tuple(np.rint(point).astype(int))
+                    self._label(image, f"{label} {value}", (xy[0]+10, xy[1]+25))
+                valid = sum(reading["mm"] is not None for reading in readings)
+                self._text(image, f"Depth check: {valid}/10 colored markers with valid depth", 0)
+                self._text(image, "Move tip toward/away; its mm value must change", 1)
+            return image
         if self.missed is not None and np.any(self.missed):
             self._text(image, f"Bending: {status} | angle paused until markers return", 0)
             return image
@@ -499,7 +552,13 @@ class BendingOverlay:
         converter = vision.pixel_to_robot if vision is not None else None
         # The mount may be outside the image or have no usable depth. The ten
         # colored discs alone are sufficient to measure the rod's 3D bends.
-        xyz, depth_status = spatial_points(points[::-1], depth, converter)
+        if depth is not None and not aligned_depth:
+            xyz, depth_status = None, "depth not aligned to color; showing 2D"
+        elif depth is not None and readings is None:
+            xyz, depth_status = None, "depth/color size mismatch; showing 2D"
+        else:
+            xyz, depth_status = spatial_points(points[::-1], depth, converter,
+                                               readings=readings[::-1] if readings is not None else None)
         if xyz is not None:
             sections_3d = bend_sections(xyz)
             depth_status = ("3D " + (" | ".join(f"B{i} {angle:.1f} deg" for i, (_, _, angle)
@@ -641,6 +700,7 @@ class RGBCamera:
 
 class RealSenseBendingCamera:
     """Aligned color/depth stream for a motor-free 3D bending preview."""
+    aligned_depth = True
     def __init__(self, width=1280, height=720):
         probe_code = ("import pyrealsense2 as rs; "
                       "p=rs.pipeline(); c=rs.config(); "
@@ -684,11 +744,11 @@ class RealSenseBendingCamera:
         self.pipeline.stop()
 
 
-def run_preview(camera):
+def run_preview(camera, depth_check=False):
     """Test marker tracking without the motor controller."""
-    window = "Bending preview (v toggle, q quit)"
+    window = "Bending depth check (s save, q quit)" if depth_check else "Bending preview (v toggle, q quit)"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    overlay = BendingOverlay(enabled=True)
+    overlay = BendingOverlay(enabled=True, depth_check=depth_check)
     try:
         while True:
             camera.update()
@@ -701,5 +761,22 @@ def run_preview(camera):
                 break
             if key == ord("v"):
                 overlay.enabled = not overlay.enabled
+            if (key == ord("s") and depth_check and overlay.last_points is not None
+                    and overlay.last_depth_readings is not None):
+                directory = Path(__file__).with_name("runs")
+                directory.mkdir(exist_ok=True)
+                stem = datetime.now().strftime("bending_depth_%Y%m%d_%H%M%S")
+                path = directory / f"{stem}.csv"
+                with path.open("w", newline="") as output:
+                    writer = csv.writer(output)
+                    writer.writerow(("marker", "x_px", "y_px", "depth_mm", "valid_pixels",
+                                     "colored_pixels", "depth_iqr_mm"))
+                    for index, (point, reading) in enumerate(zip(overlay.last_points,
+                                                                  overlay.last_depth_readings)):
+                        writer.writerow(("TIP" if index == 0 else f"B{MARKER_COUNT-index}",
+                                         *point, reading["mm"], reading["valid"],
+                                         reading["colored"], reading["spread"]))
+                cv2.imwrite(str(directory / f"{stem}.png"), frame)
+                print(f"Saved depth check: {path}")
     finally:
         cv2.destroyWindow(window)

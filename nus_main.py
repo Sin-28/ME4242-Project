@@ -771,11 +771,11 @@ def cmd_bending_setup(_cfg, args):
 
 def cmd_bending_preview(_cfg, args):
     try:
-        camera = RealSenseBendingCamera() if args.depth else RGBCamera(args.camera)
+        camera = RealSenseBendingCamera() if args.depth or args.depth_check else RGBCamera(args.camera)
     except RuntimeError as exc:
         sys.exit(str(exc))
     try:
-        run_bending_preview(camera)
+        run_bending_preview(camera, depth_check=args.depth_check)
     finally:
         camera.close()
         cv2.destroyAllWindows()
@@ -793,6 +793,8 @@ def main():
     p_preview = sub.add_parser("bending-preview", help="preview bending without motors; --depth enables 3D")
     p_preview.add_argument("--camera", type=int, default=0, help="OpenCV RGB camera index (default 0)")
     p_preview.add_argument("--depth", action="store_true", help="use aligned RealSense color/depth for 3D bends")
+    p_preview.add_argument("--depth-check", action="store_true",
+                           help="show depth in mm on the green tip and each blue marker, without bend angles")
     sub.add_parser("jog", help="wind cables by keyboard: take up slack, find pull directions")
     p_cal = sub.add_parser("calibrate", help="find cable directions/taut points and measure the model")
     p_cal.add_argument("--first-direction", type=int, choices=(-1, 1), default=-1,

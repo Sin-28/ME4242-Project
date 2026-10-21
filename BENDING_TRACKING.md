@@ -39,6 +39,20 @@ aligned RealSense depth stream:
 python nus_main.py bending-preview --depth
 ```
 
+Before trusting 3D angles, check the aligned depth of each marker:
+
+```bash
+python nus_main.py bending-preview --depth-check
+```
+
+This shows a millimeter reading beside the green tip and every blue disc.
+Move one marker toward and away from the camera: its reading should decrease
+and increase respectively while stationary markers remain steady. `--` means
+there were too few valid depth pixels on that colored disc or the readings
+disagreed. Press `s` to save the annotated view and a CSV with depth, valid
+pixel count, and depth spread in `runs/`. The 3D bending view uses these
+color-gated readings rather than nearby background depth.
+
 This uses 1280×720 aligned color/depth frames so the saved RGB setup can be
 reused. On the test Mac the SDK crashes while starting either 640×480 or
 1280×720 depth streams; the command checks this in a child process and reports
@@ -80,7 +94,7 @@ image. Local tracking can follow a brief reversal in image x, but a full
 reacquisition still needs the markers to separate across the image. The
 dedicated `--depth` preview
 aligns depth to color and deprojects each marker using RealSense intrinsics.
-The regular N-U-S commands use the existing `emioapi` camera calibration and
-millimeter depth frame without explicit pixel alignment, so those 3D values
-are provisional until alignment and physical accuracy are verified.
+The regular N-U-S commands use the existing `emioapi` camera, which does not
+explicitly align depth pixels to the color image. Their bending overlay shows
+2D only until aligned depth is supplied, avoiding misleading 3D readings.
 The repository tests use synthetic color and depth frames.
