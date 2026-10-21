@@ -60,8 +60,13 @@ def marker_chain(frame, settings):
     """Locate colored discs along image x; returns left-to-right centers."""
     roi = settings["roi"]
     x0, y0, width, height = roi
-    mask = cv2.bitwise_or(color_mask(frame, settings["blue_hsv"], 15, roi),
-                          color_mask(frame, settings["green_hsv"], 7, roi))
+    blue_hue, green_hue = settings["blue_hsv"][0], settings["green_hsv"][0]
+    hue_gap = min(abs(blue_hue-green_hue), 180-abs(blue_hue-green_hue))
+    distinct_tip = hue_gap >= 16
+    blue_mask = color_mask(frame, settings["blue_hsv"],
+                           min(15, hue_gap-6) if distinct_tip else 15, roi)
+    green_mask = color_mask(frame, settings["green_hsv"], 7, roi)
+    mask = blue_mask if distinct_tip else cv2.bitwise_or(blue_mask, green_mask)
     region = mask[y0:y0+height, x0:x0+width]
     projection = (region > 0).sum(axis=0).astype(np.float32)
     projection = cv2.GaussianBlur(projection.reshape(1, -1), (0, 0), 7).ravel()
@@ -95,6 +100,22 @@ def marker_chain(frame, settings):
         expected = left[1] + (right[1]-left[1])*(mid[0]-left[0])/(right[0]-left[0])
         if abs(mid[1]-expected) > 80:
             points.pop(i)
+    if distinct_tip and points:
+        contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        tips = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            x, y, w, h = cv2.boundingRect(contour)
+            if area < 100 or w < 8 or h < 8 or max(w/h, h/w) > 2.5:
+                continue
+            moments = cv2.moments(contour)
+            if moments["m00"]:
+                center = (moments["m10"]/moments["m00"], moments["m01"]/moments["m00"])
+                if center[0] < points[0][0]-7:
+                    tips.append((area, center))
+        if not tips:
+            return [], "green tip not found"
+        points.insert(0, max(tips, key=lambda item: item[0])[1])
     if len(points) < 7:
         return [], f"markers {len(points)}/{MARKER_COUNT}"
     return points, f"markers {len(points)}/{MARKER_COUNT}"
@@ -204,7 +225,8 @@ class BendingOverlay:
         bend = split_two_bends(turns)
         two_d = (f"2D base {bend[1]:+.1f} | tip {bend[2]:+.1f} deg" if bend
                  else f"2D bend {turns.sum():+.1f} deg")
-        three_d, depth_status = spatial_angles(ordered, bend, depth, vision.pixel_to_robot)
+        converter = vision.pixel_to_robot if vision is not None else None
+        _three_d, depth_status = spatial_angles(ordered, bend, depth, converter)
         cv2.polylines(image, [np.asarray(ordered, np.int32)], False, (255, 255, 255), 2)
         for point in ordered[1:]:
             cv2.circle(image, tuple(map(int, point)), 4, (0, 255, 255), -1)
@@ -293,5 +315,42 @@ def run_setup(camera):
                     roi = tuple(int(v) for v in selected)
                     persist()
                 cv2.setMouseCallback(window, mouse)
+    finally:
+        cv2.destroyWindow(window)
+
+
+class RGBCamera:
+    """OpenCV color-only camera for setup/preview when the depth SDK is unavailable."""
+    def __init__(self, index=0):
+        self.capture = cv2.VideoCapture(index)
+        if not self.capture.isOpened():
+            raise RuntimeError(f"Could not open RGB camera {index}")
+        self.frame = None
+
+    def update(self):
+        ok, self.frame = self.capture.read()
+        if not ok or self.frame is None:
+            raise RuntimeError("Could not read RGB frame")
+
+    def close(self):
+        self.capture.release()
+
+
+def run_preview(camera):
+    """Test marker tracking without the depth SDK or motor controller."""
+    window = "Bending RGB preview (v toggle, q quit)"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    overlay = BendingOverlay(enabled=True)
+    try:
+        while True:
+            camera.update()
+            frame = camera.frame.copy()
+            overlay.draw(frame, camera.frame, None, None)
+            cv2.imshow(window, frame)
+            key = cv2.waitKey(1) & 0xff
+            if key in (ord("q"), 27):
+                break
+            if key == ord("v"):
+                overlay.enabled = not overlay.enabled
     finally:
         cv2.destroyWindow(window)

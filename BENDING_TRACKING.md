@@ -12,6 +12,9 @@ With the camera connected, run:
 python nus_main.py bending-setup
 ```
 
+This setup uses the D405 RGB feed through OpenCV and does not start the depth
+SDK or motors. If the D405 is not camera index 0, add `--camera N`.
+
 In the camera window, press `r` and draw an ROI that includes the green tip and
 all nine blue discs **throughout their expected movement**. The fixed base mount
 can stay outside the ROI. Press `a`, then click the point where the rod leaves
@@ -21,6 +24,18 @@ finish. The settings are saved in ignored `bending_config.json` and reused when
 the frame size matches. Run setup again if the camera or mount moves.
 
 ## Turn it on and off
+
+Check the RGB tracking without motors or the depth SDK:
+
+```bash
+python nus_main.py bending-preview
+```
+
+The RGB preview shows 2D angles only. The regular N-U-S commands still use
+`Vision.open_camera()` from `emioapi` for aligned depth. On the test Mac, the
+D405 appeared on USB and RGB preview worked, but opening this `emioapi` depth
+camera crashed its process. The integrated 3D overlay therefore still needs
+a successful depth-camera startup before it can be validated live.
 
 Append `--bending` to any existing command, for example:
 

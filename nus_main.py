@@ -35,7 +35,7 @@ from nus_control import (MAX_TRAVEL_RAD, PULL_MAX_MM, PULLEY_RADIUS_MM, Cables, 
                          probe_model, raise_tip, reachability, reset_live_model, set_live_model, solve_pulls)
 from nus_path import densify, footprint, min_clearance, path_length, plan_path, touched
 from nus_vision import LETTERS, Vision, draw_overlay, fmt, load_config, save_config_value
-from nus_bending import BendingOverlay, run_setup as run_bending_setup
+from nus_bending import BendingOverlay, RGBCamera, run_preview as run_bending_preview, run_setup as run_bending_setup
 
 WINDOW = "NUS retrieval  (q / Esc = stop)"
 
@@ -756,10 +756,25 @@ def cmd_goto(cfg, args):
         cv2.destroyAllWindows()
 
 
-def cmd_bending_setup(_cfg, _args):
-    camera = open_camera_or_exit()
+def cmd_bending_setup(_cfg, args):
+    try:
+        camera = RGBCamera(args.camera)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
     try:
         run_bending_setup(camera)
+    finally:
+        camera.close()
+        cv2.destroyAllWindows()
+
+
+def cmd_bending_preview(_cfg, args):
+    try:
+        camera = RGBCamera(args.camera)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
+    try:
+        run_bending_preview(camera)
     finally:
         camera.close()
         cv2.destroyAllWindows()
@@ -772,7 +787,10 @@ def main():
     p_chk.add_argument("--apply", action="store_true", help="save the measured stage height to nus_config.json")
     p_chk.add_argument("--letter-mm", type=float, default=5.0, help="letter thickness in mm (default 5)")
     sub.add_parser("detect", help="camera only: show detections, teach letter shapes")
-    sub.add_parser("bending-setup", help="camera only: save the rod ROI, base and marker colors")
+    p_setup = sub.add_parser("bending-setup", help="RGB camera only: save the rod ROI, base and marker colors")
+    p_setup.add_argument("--camera", type=int, default=0, help="OpenCV RGB camera index (default 0)")
+    p_preview = sub.add_parser("bending-preview", help="RGB camera only: preview bending without depth or motors")
+    p_preview.add_argument("--camera", type=int, default=0, help="OpenCV RGB camera index (default 0)")
     sub.add_parser("jog", help="wind cables by keyboard: take up slack, find pull directions")
     p_cal = sub.add_parser("calibrate", help="find cable directions/taut points and measure the model")
     p_cal.add_argument("--first-direction", type=int, choices=(-1, 1), default=-1,
@@ -814,7 +832,7 @@ def main():
                      help=f"most each cable may pull, in mm (default: the calibration's, {PULL_MAX_MM:.0f}); "
                           "more lets the arm bend further (reach further, raise the tip higher)")
     for command, subparser in sub.choices.items():
-        if command != "bending-setup":
+        if command not in ("bending-setup", "bending-preview"):
             subparser.add_argument("--bending", action="store_true",
                                    help="show live 2D/3D rod bending angles (v toggles during the run)")
     args = parser.parse_args()
@@ -827,6 +845,7 @@ def main():
 
     cfg = load_config()
     commands = {"check": cmd_check, "detect": cmd_detect, "bending-setup": cmd_bending_setup,
+                "bending-preview": cmd_bending_preview,
                 "jog": cmd_jog, "calibrate": cmd_calibrate,
                 "goto": cmd_goto, "search": cmd_search}
     commands[args.command](cfg, args)

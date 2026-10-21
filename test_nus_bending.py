@@ -66,6 +66,19 @@ class BendingTests(unittest.TestCase):
             self.assertIs(overlay.draw(output, frame, None, None), output)
         self.assertTrue(np.array_equal(output, frame))
 
+    def test_distinct_green_tip_next_to_blue_disc(self):
+        frame = np.full((240, 650, 3), 110, np.uint8)
+        blue, green = (200, 150, 60), (90, 230, 90)
+        cv2.circle(frame, (50, 120), 10, green, -1)
+        for x in (72, 125, 180, 235, 290, 345, 400, 455, 510):
+            cv2.circle(frame, (x, 120), 10, blue, -1)
+        hsv = lambda color: [int(v) for v in cv2.cvtColor(np.uint8([[color]]), cv2.COLOR_BGR2HSV)[0, 0]]
+        points, status = marker_chain(frame, {"roi": [30, 90, 510, 60],
+                                              "blue_hsv": hsv(blue), "green_hsv": hsv(green)})
+        self.assertEqual(len(points), 10, status)
+        self.assertAlmostEqual(points[0][0], 50, delta=3)
+        self.assertAlmostEqual(points[1][0], 72, delta=3)
+
 
 if __name__ == "__main__":
     unittest.main()
