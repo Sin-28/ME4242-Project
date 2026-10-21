@@ -7,7 +7,8 @@ import cv2
 import numpy as np
 
 from nus_bending import (BendingOverlay, bend_sections, follow_markers, load_settings, marker_chain,
-                         save_settings, spatial_angles, spatial_points, split_two_bends, turning_angles)
+                         save_settings, spatial_angles, spatial_points, split_two_bends, turning_angles,
+                         valid_chain)
 
 
 class BendingTests(unittest.TestCase):
@@ -130,6 +131,31 @@ class BendingTests(unittest.TestCase):
                                             lambda x, y, z: (x-20, y-50, z))
         self.assertIn("3D", message)
         self.assertGreaterEqual(len(bend_sections(recovered, min_bend=8)), 1)
+
+    def test_overlapping_markers_are_rejected_and_reacquired(self):
+        frame, settings = self.frame_and_settings()
+        points, _ = marker_chain(frame, settings)
+        self.assertTrue(valid_chain(points, settings["base"]))
+        duplicate = list(points)
+        duplicate[1] = duplicate[0]
+        self.assertFalse(valid_chain(duplicate, settings["base"]))
+        settings["reference_points"] = points
+        overlay = BendingOverlay(True)
+        overlay.settings = settings
+        overlay.shape = frame.shape[:2]
+        overlay.last_points = np.asarray(duplicate, float)
+        overlay.missed = np.zeros(10, int)
+        view = frame.copy()
+        overlay.draw(view, frame, None, None)
+        self.assertIsNotNone(overlay.last_points)
+        self.assertTrue(valid_chain(overlay.last_points, settings["base"]))
+        self.assertFalse(np.array_equal(view, frame))
+
+    def test_tracking_extends_roi_toward_base(self):
+        frame, settings = self.frame_and_settings()
+        settings["roi"] = [20, 180, 850, 280]  # excludes the base-side blue disc
+        points, status = marker_chain(frame, settings)
+        self.assertEqual(len(points), 10, status)
 
 
 if __name__ == "__main__":

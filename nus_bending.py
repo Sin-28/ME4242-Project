@@ -2,6 +2,8 @@
 
 import json
 import math
+import subprocess
+import sys
 from pathlib import Path
 
 import cv2
@@ -64,9 +66,21 @@ def color_mask(frame, target, tolerance, roi):
                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
 
+def tracking_roi(settings, shape):
+    """Keep the base-side discs in view even if setup ROI ended too early."""
+    height, width = shape[:2]
+    x, y, w, h = settings["roi"]
+    base_x, base_y = settings.get("base", (x+w, y+h//2))
+    x0 = max(0, x-50)
+    y0 = max(0, min(y-60, base_y-100))
+    x1 = min(width, max(x+w, base_x+30))
+    y1 = min(height, max(y+h+60, base_y+100))
+    return x0, y0, x1-x0, y1-y0
+
+
 def marker_chain(frame, settings, previous=None, hue_offset=0):
     """Locate colored discs along image x; returns left-to-right centers."""
-    roi = settings["roi"]
+    roi = tracking_roi(settings, frame.shape)
     x0, y0, width, height = roi
     blue_target = ((settings["blue_hsv"][0] + hue_offset) % 180, *settings["blue_hsv"][1:])
     green_target = ((settings["green_hsv"][0] + hue_offset) % 180, *settings["green_hsv"][1:])
@@ -140,28 +154,36 @@ def marker_chain(frame, settings, previous=None, hue_offset=0):
     return points, f"markers {len(points)}/{MARKER_COUNT}"
 
 
-def follow_markers(frame, settings, previous, hue_offset):
+def follow_markers(frame, settings, previous, hue_offset, missed=None):
     """Find each known marker in a small window around its last location."""
     blue_target = ((settings["blue_hsv"][0]+hue_offset) % 180, *settings["blue_hsv"][1:])
     green_target = ((settings["green_hsv"][0]+hue_offset) % 180, *settings["green_hsv"][1:])
-    blue_mask = color_mask(frame, blue_target, 13, settings["roi"])
-    green_mask = color_mask(frame, green_target, 9, settings["roi"])
+    roi = tracking_roi(settings, frame.shape)
+    blue_mask = color_mask(frame, blue_target, 13, roi)
+    green_mask = color_mask(frame, green_target, 9, roi)
     height, width = frame.shape[:2]
     found = []
     for index, (x, y) in enumerate(previous):
         x, y = int(round(x)), int(round(y))
         neighbors = [abs(x-previous[j][0]) for j in (index-1, index+1)
                      if 0 <= j < len(previous)]
-        radius_x = min(20, max(10, int(min(neighbors)*.45)))
-        radius_y = 27
+        lost = int(missed[index]) if missed is not None else 0
+        radius_x = (min(50, 22+lost*8) if index == 0 else
+                    min(32, max(12, int(min(neighbors)*.45)+lost*5)))
+        radius_y = min(90, 27+lost*12)
         x0, x1 = max(0, x-radius_x), min(width, x+radius_x+1)
         y0, y1 = max(0, y-radius_y), min(height, y+radius_y+1)
         mask = green_mask if index == 0 else blue_mask
-        ys, xs = np.nonzero(mask[y0:y1, x0:x1])
-        if len(xs) < (18 if index == 0 else 45):
-            found.append(None)
-        else:
-            found.append((float(x0+np.median(xs)), float(y0+np.median(ys))))
+        region = mask[y0:y1, x0:x1]
+        count, labels, stats, centers = cv2.connectedComponentsWithStats(region)
+        candidates = []
+        for component in range(1, count):
+            area = stats[component, cv2.CC_STAT_AREA]
+            if area < (18 if index == 0 else 45):
+                continue
+            center = centers[component] + (x0, y0)
+            candidates.append((float(np.linalg.norm(center-(x, y))), tuple(center)))
+        found.append(min(candidates)[1] if candidates else None)
     return found
 
 
@@ -172,6 +194,29 @@ def turning_angles(points):
     a, b = vectors[:-1], vectors[1:]
     return np.degrees(np.arctan2(a[:, 0]*b[:, 1]-a[:, 1]*b[:, 0],
                                  np.sum(a*b, axis=1)))
+
+
+def valid_chain(points, base):
+    """Reject duplicated detections before they can poison the tracker."""
+    if points is None or len(points) != MARKER_COUNT:
+        return False
+    ordered = np.asarray(points, float)
+    gaps = np.linalg.norm(np.diff(ordered, axis=0), axis=1)
+    return bool(np.all(np.isfinite(ordered)) and np.all(gaps >= 7)
+                and np.all(np.diff(ordered[:, 0]) > 5))
+
+
+def effective_base(settings, points):
+    """Extrapolate the base when its saved pixel falls behind the last disc."""
+    base = np.asarray(settings["base"], float)
+    if base[0] > points[-1][0]+7:
+        return tuple(base)
+    reference = settings.get("reference_points")
+    gap = (base[0]-reference[-1][0]) if reference is not None else 75
+    gap = max(30., float(gap))
+    tangent = np.asarray(points[-1], float)-np.asarray(points[-2], float)
+    tangent /= max(np.linalg.norm(tangent), 1e-9)
+    return tuple(np.asarray(points[-1])+gap*tangent)
 
 
 def split_two_bends(turns, min_bend=15.0):
@@ -308,17 +353,18 @@ class BendingOverlay:
             previous = np.asarray(reference, float)
             for offset in (self.hue_offset, 0, 10, -10, 20, -20):
                 found = follow_markers(frame, self.settings, previous, offset)
-                if all(point is not None for point in found):
+                if all(point is not None for point in found) and valid_chain(found, self.settings["base"]):
                     self.last_points = np.asarray(found, float)
                     self.missed = np.zeros(MARKER_COUNT, int)
                     self.hue_offset = offset
                     return self.last_points.copy(), "10/10 reacquired"
         best, status = [], "markers 0/10"
-        for offset in dict.fromkeys((self.hue_offset, 0, 5, -5, 10, -10, 15, -15, 20, -20)):
+        for offset in dict.fromkeys((self.hue_offset, 0, 2, -2, 4, -4, 5, -5,
+                                         10, -10, 15, -15, 20, -20)):
             candidate, candidate_status = marker_chain(frame, self.settings, None, offset)
             if len(candidate) > len(best):
                 best, status = candidate, candidate_status
-            if len(candidate) == MARKER_COUNT:
+            if valid_chain(candidate, self.settings["base"]):
                 self.last_points = np.asarray(candidate, float)
                 self.missed = np.zeros(MARKER_COUNT, int)
                 self.hue_offset = offset
@@ -381,7 +427,7 @@ class BendingOverlay:
                 visible += 1
             else:
                 self.missed[index] += 1
-        if np.any(self.missed > 5):
+        if np.any(self.missed > 5) or not valid_chain(updated, self.settings["base"]):
             self.last_points = self.missed = None
             return None, "tracking lost; reacquiring markers"
         self.last_points = updated
@@ -404,7 +450,7 @@ class BendingOverlay:
             return image
         offset = self._current_hue_offset(frame)
         if self.last_points is not None:
-            detected = follow_markers(frame, self.settings, self.last_points, offset)
+            detected = follow_markers(frame, self.settings, self.last_points, offset, self.missed)
             detection_status = f"local {sum(p is not None for p in detected)}/10"
             points, status = self._stable_indexed(detected)
             if points is None:
@@ -415,39 +461,50 @@ class BendingOverlay:
         if points is None:
             self._text(image, "Bending: " + status + " (" + detection_status + ")", 0)
             return image
-        base = tuple(self.settings["base"])
-        if base[0] <= points[-1][0]:
-            self._text(image, "Bending: base must be right of markers", 0)
-            return image
-        ordered = [base] + points[::-1]
+        base = effective_base(self.settings, points)
+        ordered = [base] + list(points[::-1])
+        self._draw_chain(image, ordered)
         try:
             turns = turning_angles(ordered)
         except ValueError as exc:
-            self._text(image, "Bending: " + str(exc), 0)
+            self._text(image, "Bending: tracking geometry invalid; reacquiring", 0)
+            self.last_points = self.missed = None
             return image
         sections_2d = bend_sections(ordered)
         two_d = ("2D " + (" | ".join(f"B{i} {angle:+.1f} deg" for i, (_, _, angle)
                                     in enumerate(sections_2d, 1)) if sections_2d else "straight"))
         converter = vision.pixel_to_robot if vision is not None else None
-        xyz, depth_status = spatial_points(ordered, depth, converter)
+        # The mount may be outside the image or have no usable depth. The ten
+        # colored discs alone are sufficient to measure the rod's 3D bends.
+        xyz, depth_status = spatial_points(points[::-1], depth, converter)
         if xyz is not None:
             sections_3d = bend_sections(xyz)
             depth_status = ("3D " + (" | ".join(f"B{i} {angle:.1f} deg" for i, (_, _, angle)
                                              in enumerate(sections_3d, 1)) if sections_3d else "straight"))
-        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 0, 0), 6)
-        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 255, 255), 3)
-        cv2.circle(image, tuple(map(int, base)), 12, (0, 0, 255), 3)
-        for index, point in enumerate(ordered[1:], 1):
-            center = tuple(map(int, point))
-            color = (0, 255, 0) if index == MARKER_COUNT else (255, 100, 0)
-            cv2.circle(image, center, 13, (0, 0, 0), 6)
-            cv2.circle(image, center, 13, color, 4)
-            cv2.putText(image, "T" if index == MARKER_COUNT else str(index),
-                        (center[0]+11, center[1]-10), cv2.FONT_HERSHEY_SIMPLEX, .45,
-                        color, 2)
+        for index, (start, end, angle) in enumerate(sections_2d, 1):
+            center = tuple(np.rint((np.asarray(ordered[start])+ordered[end])/2).astype(int))
+            self._label(image, f"B{index} {angle:+.0f}d", (center[0], center[1]-28))
         self._text(image, f"Bending: {status} | {two_d}", 0)
         self._text(image, depth_status, 1)
         return image
+
+    @staticmethod
+    def _label(image, label, position):
+        cv2.putText(image, label, position, cv2.FONT_HERSHEY_SIMPLEX, .58, (0, 0, 0), 4)
+        cv2.putText(image, label, position, cv2.FONT_HERSHEY_SIMPLEX, .58, (0, 255, 255), 2)
+
+    def _draw_chain(self, image, ordered):
+        """Draw markers, path and tip directly at their measured image positions."""
+        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 0, 0), 7)
+        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 255, 255), 3)
+        cv2.circle(image, tuple(map(int, ordered[0])), 12, (0, 0, 255), 3)
+        for index, point in enumerate(ordered[1:], 1):
+            center = tuple(np.rint(point).astype(int))
+            color = (0, 255, 0) if index == MARKER_COUNT else (255, 100, 0)
+            cv2.circle(image, center, 13, (0, 0, 0), 6)
+            cv2.circle(image, center, 13, color, 4)
+            self._label(image, "TIP" if index == MARKER_COUNT else str(index),
+                        (center[0]+12, center[1]-12))
 
     @staticmethod
     def _text(image, text, row):
@@ -559,16 +616,62 @@ class RGBCamera:
         self.capture.release()
 
 
+class RealSenseBendingCamera:
+    """Aligned color/depth stream for a motor-free 3D bending preview."""
+    def __init__(self, width=1280, height=720):
+        probe_code = ("import pyrealsense2 as rs; "
+                      "p=rs.pipeline(); c=rs.config(); "
+                      f"c.enable_stream(rs.stream.color,{width},{height},rs.format.bgr8,30); "
+                      f"c.enable_stream(rs.stream.depth,{width},{height},rs.format.z16,30); "
+                      "p.start(c); p.stop()")
+        probe = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            capture_output=True, text=True, timeout=12)
+        if probe.returncode != 0:
+            raise RuntimeError(f"RealSense depth stream failed (exit {probe.returncode}); "
+                               "3D bending cannot run on this computer. "
+                               "Use bending-preview without --depth for RGB tracking.")
+        import pyrealsense2 as rs
+        self.rs = rs
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, 30)
+        config.enable_stream(rs.stream.depth, width, height, rs.format.z16, 30)
+        self.profile = self.pipeline.start(config)
+        self.align = rs.align(rs.stream.color)
+        self.depth_scale = self.profile.get_device().first_depth_sensor().get_depth_scale()
+        self.frame = self.depth_frame = None
+        self.intrinsics = None
+
+    def update(self):
+        frames = self.align.process(self.pipeline.wait_for_frames())
+        color, depth = frames.get_color_frame(), frames.get_depth_frame()
+        if not color or not depth:
+            raise RuntimeError("No synchronized color/depth frames")
+        self.frame = np.asanyarray(color.get_data())
+        self.depth_frame = np.rint(np.asanyarray(depth.get_data()).astype(float)
+                                    * self.depth_scale * 1000).astype(np.uint16)
+        self.intrinsics = color.profile.as_video_stream_profile().intrinsics
+
+    def pixel_to_robot(self, x, y, depth_mm):
+        return np.asarray(self.rs.rs2_deproject_pixel_to_point(
+            self.intrinsics, [float(x), float(y)], float(depth_mm)), float)
+
+    def close(self):
+        self.pipeline.stop()
+
+
 def run_preview(camera):
-    """Test marker tracking without the depth SDK or motor controller."""
-    window = "Bending RGB preview (v toggle, q quit)"
+    """Test marker tracking without the motor controller."""
+    window = "Bending preview (v toggle, q quit)"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     overlay = BendingOverlay(enabled=True)
     try:
         while True:
             camera.update()
             frame = camera.frame.copy()
-            overlay.draw(frame, camera.frame, None, None)
+            overlay.draw(frame, camera.frame, getattr(camera, "depth_frame", None),
+                         camera if hasattr(camera, "pixel_to_robot") else None)
             cv2.imshow(window, frame)
             key = cv2.waitKey(1) & 0xff
             if key in (ord("q"), 27):

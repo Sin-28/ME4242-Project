@@ -35,7 +35,8 @@ from nus_control import (MAX_TRAVEL_RAD, PULL_MAX_MM, PULLEY_RADIUS_MM, Cables, 
                          probe_model, raise_tip, reachability, reset_live_model, set_live_model, solve_pulls)
 from nus_path import densify, footprint, min_clearance, path_length, plan_path, touched
 from nus_vision import LETTERS, Vision, draw_overlay, fmt, load_config, save_config_value
-from nus_bending import BendingOverlay, RGBCamera, run_preview as run_bending_preview, run_setup as run_bending_setup
+from nus_bending import (BendingOverlay, RGBCamera, RealSenseBendingCamera,
+                         run_preview as run_bending_preview, run_setup as run_bending_setup)
 
 WINDOW = "NUS retrieval  (q / Esc = stop)"
 
@@ -770,7 +771,7 @@ def cmd_bending_setup(_cfg, args):
 
 def cmd_bending_preview(_cfg, args):
     try:
-        camera = RGBCamera(args.camera)
+        camera = RealSenseBendingCamera() if args.depth else RGBCamera(args.camera)
     except RuntimeError as exc:
         sys.exit(str(exc))
     try:
@@ -789,8 +790,9 @@ def main():
     sub.add_parser("detect", help="camera only: show detections, teach letter shapes")
     p_setup = sub.add_parser("bending-setup", help="RGB camera only: save the rod ROI, base and marker colors")
     p_setup.add_argument("--camera", type=int, default=0, help="OpenCV RGB camera index (default 0)")
-    p_preview = sub.add_parser("bending-preview", help="RGB camera only: preview bending without depth or motors")
+    p_preview = sub.add_parser("bending-preview", help="preview bending without motors; --depth enables 3D")
     p_preview.add_argument("--camera", type=int, default=0, help="OpenCV RGB camera index (default 0)")
+    p_preview.add_argument("--depth", action="store_true", help="use aligned RealSense color/depth for 3D bends")
     sub.add_parser("jog", help="wind cables by keyboard: take up slack, find pull directions")
     p_cal = sub.add_parser("calibrate", help="find cable directions/taut points and measure the model")
     p_cal.add_argument("--first-direction", type=int, choices=(-1, 1), default=-1,

@@ -32,6 +32,20 @@ Check the RGB tracking without motors or the depth SDK:
 python nus_main.py bending-preview
 ```
 
+To measure bends toward or away from the camera without motors, use the
+aligned RealSense depth stream:
+
+```bash
+python nus_main.py bending-preview --depth
+```
+
+This uses 1280×720 aligned color/depth frames so the saved RGB setup can be
+reused. On the test Mac the SDK crashes while starting either 640×480 or
+1280×720 depth streams; the command checks this in a child process and reports
+the failure without crashing the preview process. RGB alone cannot determine
+front/back bending. Use a machine where the D405 depth stream starts normally
+to validate 3D angles.
+
 The RGB preview shows 2D angles only. The regular N-U-S commands use
 `Vision.open_camera()` from `emioapi` for depth. On the test Mac, the D405
 appeared on USB and RGB preview worked, but the RealSense SDK crashed during
@@ -56,11 +70,14 @@ unsigned 3D bend angles, including motion toward or away from the camera.
 Missing depth leaves the 2D measurement and a depth status visible. Angles are
 shown only when the full ten-marker chain is tracked; briefly held positions
 can appear during occlusion. After tracking loss, the overlay retries the saved
-reference pose and original marker colors automatically.
+reference pose and original marker colors automatically. The tracking area
+extends to the saved base position even if the selected ROI ended before the
+base-side blue marker.
 
 The marker ordering assumes the base is to the right of the tip in the image
-and the rod does not fold backward in image x. 3D values use the existing
-`emioapi` camera calibration and its millimeter depth frame. The current SDK
-returns depth and color frames without explicit pixel alignment, so the 3D
-values are provisional until alignment and physical accuracy are verified.
+and the rod does not fold backward in image x. The dedicated `--depth` preview
+aligns depth to color and deprojects each marker using RealSense intrinsics.
+The regular N-U-S commands use the existing `emioapi` camera calibration and
+millimeter depth frame without explicit pixel alignment, so those 3D values
+are provisional until alignment and physical accuracy are verified.
 The repository tests use synthetic color and depth frames.
