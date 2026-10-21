@@ -35,14 +35,16 @@ from nus_control import (MAX_TRAVEL_RAD, PULL_MAX_MM, PULLEY_RADIUS_MM, Cables, 
                          probe_model, raise_tip, reachability, reset_live_model, set_live_model, solve_pulls)
 from nus_path import densify, footprint, min_clearance, path_length, plan_path, touched
 from nus_vision import LETTERS, Vision, draw_overlay, fmt, load_config, save_config_value
+from nus_bending import BendingOverlay, run_setup as run_bending_setup
 
 WINDOW = "NUS retrieval  (q / Esc = stop)"
 
 
 class Display:
-    def __init__(self, vision, recorder=None):
+    def __init__(self, vision, recorder=None, bending=False):
         self.vision = vision
         self.recorder = recorder
+        self.bending = BendingOverlay(enabled=bending)
         self.candidates, self.detections = [], {}
         self.target_px, self.lines = None, []
         self.target_pos, self.timer_start = None, None     # live distance + timer while moving
@@ -88,10 +90,15 @@ class Display:
         if self.target_px is not None and tip is not None and self.path is None:
             cv2.line(image, tuple(int(v) for v in tip["px"]), tuple(int(v) for v in self.target_px),
                      (255, 0, 255), 1, cv2.LINE_AA)
+        if self.bending.enabled:
+            self.bending.draw(image, frame, self.vision.camera.depth_frame, self.vision)
         if self.recorder is not None:
             self.recorder.write(image)
         cv2.imshow(WINDOW, image)
         key = cv2.waitKey(1) & 0xFF
+        if key == ord("v"):
+            self.bending.enabled = not self.bending.enabled
+            print(f"Bending overlay {'on' if self.bending.enabled else 'off'}")
         if key in (ord("q"), 27):
             raise KeyboardInterrupt("stopped from the camera window")
         return key
@@ -179,7 +186,7 @@ def teach_color_and_shape(vision, letter, frame, depth, click, replace=False):
 def cmd_detect(cfg, args):
     camera = open_camera_or_exit()
     vision = Vision(cfg, camera)
-    display = Display(vision)
+    display = Display(vision, bending=args.bending)
     state = {"click": None, "frame": None, "depth": None, "candidates": [], "taught": set()}
 
     def on_mouse(event, x, y, flags, param):
@@ -256,7 +263,7 @@ def cmd_check(cfg, args):
         print("Camera      : NOT FOUND - close EMIO Labs, check the USB cable")
         return
     vision = Vision(cfg, camera)
-    display = Display(vision)
+    display = Display(vision, bending=args.bending)
     try:
         for _ in range(15):                                  # let auto-exposure settle
             frame, depth = vision.grab()
@@ -321,7 +328,7 @@ def cmd_calibrate(cfg, args):
     camera = open_camera_or_exit()
     cables = Cables()
     vision = Vision(cfg, camera)
-    display = Display(vision)
+    display = Display(vision, bending=args.bending)
     display.lines = ["calibrating..."]
     try:
         if not cables.open():
@@ -494,7 +501,7 @@ def cmd_search(cfg, args):
     camera = open_camera_or_exit()
     vision = Vision(cfg, camera)
     recorder = Recorder(RUNS_DIR / f"search_{time.strftime('%Y%m%d_%H%M%S')}.mp4") if args.record else None
-    display = Display(vision, recorder)
+    display = Display(vision, recorder, bending=args.bending)
     cables = Cables(calib)
     rows = []
     try:
@@ -649,7 +656,7 @@ def cmd_jog(cfg, args):
     camera = open_camera_or_exit()
     cables = Cables(max_travel_rad=5.0)              # by hand: allow up to ~100 mm per cable
     vision = Vision(cfg, camera)
-    display = Display(vision)
+    display = Display(vision, bending=args.bending)
     steps_mm = {ord("w"): 1.0, ord("s"): -1.0, ord("W"): 5.0, ord("S"): -5.0}
     try:
         if not cables.open():
@@ -697,7 +704,7 @@ def cmd_goto(cfg, args):
 
     camera = open_camera_or_exit()
     vision = Vision(cfg, camera)
-    display = Display(vision)
+    display = Display(vision, bending=args.bending)
     cables = None
     try:
         found = locate_letters(vision, display)
@@ -749,6 +756,15 @@ def cmd_goto(cfg, args):
         cv2.destroyAllWindows()
 
 
+def cmd_bending_setup(_cfg, _args):
+    camera = open_camera_or_exit()
+    try:
+        run_bending_setup(camera)
+    finally:
+        camera.close()
+        cv2.destroyAllWindows()
+
+
 def main():
     parser = argparse.ArgumentParser(description="N-U-S letter retrieval with the EMIO cable manipulator")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -756,6 +772,7 @@ def main():
     p_chk.add_argument("--apply", action="store_true", help="save the measured stage height to nus_config.json")
     p_chk.add_argument("--letter-mm", type=float, default=5.0, help="letter thickness in mm (default 5)")
     sub.add_parser("detect", help="camera only: show detections, teach letter shapes")
+    sub.add_parser("bending-setup", help="camera only: save the rod ROI, base and marker colors")
     sub.add_parser("jog", help="wind cables by keyboard: take up slack, find pull directions")
     p_cal = sub.add_parser("calibrate", help="find cable directions/taut points and measure the model")
     p_cal.add_argument("--first-direction", type=int, choices=(-1, 1), default=-1,
@@ -796,6 +813,10 @@ def main():
     p_s.add_argument("--pull-max-mm", type=float, default=None,
                      help=f"most each cable may pull, in mm (default: the calibration's, {PULL_MAX_MM:.0f}); "
                           "more lets the arm bend further (reach further, raise the tip higher)")
+    for command, subparser in sub.choices.items():
+        if command != "bending-setup":
+            subparser.add_argument("--bending", action="store_true",
+                                   help="show live 2D/3D rod bending angles (v toggles during the run)")
     args = parser.parse_args()
     if args.command == "calibrate" and not 1 <= args.search_mm <= 100:
         parser.error("--search-mm must be between 1 and 100")
@@ -805,7 +826,8 @@ def main():
             parser.error(f"--pull-max-mm must be between 1 and {limit:.0f} mm of cable")
 
     cfg = load_config()
-    commands = {"check": cmd_check, "detect": cmd_detect, "jog": cmd_jog, "calibrate": cmd_calibrate,
+    commands = {"check": cmd_check, "detect": cmd_detect, "bending-setup": cmd_bending_setup,
+                "jog": cmd_jog, "calibrate": cmd_calibrate,
                 "goto": cmd_goto, "search": cmd_search}
     commands[args.command](cfg, args)
 
