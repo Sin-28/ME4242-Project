@@ -30,15 +30,23 @@ def load_settings(shape, path=CONFIG_PATH):
             values = settings[key]
             if len(values) != 3 or any(not isinstance(v, int) or not 0 <= v <= 255 for v in values):
                 return None
+        reference = settings.get("reference_points")
+        if reference is not None and (len(reference) != MARKER_COUNT or
+                                      any(len(point) != 2 or not (0 <= point[0] < width and
+                                                                   0 <= point[1] < height)
+                                          for point in reference)):
+            return None
         return settings
     except (OSError, ValueError, TypeError, KeyError, IndexError):
         return None
 
 
-def save_settings(shape, roi, base, blue_hsv, green_hsv, path=CONFIG_PATH):
+def save_settings(shape, roi, base, blue_hsv, green_hsv, path=CONFIG_PATH, reference_points=None):
     height, width = shape[:2]
     data = {"frame_size": [width, height], "roi": list(roi), "base": list(base),
             "blue_hsv": list(blue_hsv), "green_hsv": list(green_hsv)}
+    if reference_points is not None:
+        data["reference_points"] = [list(point) for point in reference_points]
     Path(path).write_text(json.dumps(data, indent=2) + "\n")
 
 
@@ -48,7 +56,7 @@ def color_mask(frame, target, tolerance, roi):
     distance = abs(hsv[..., 0].astype(np.int16) - hue)
     distance = np.minimum(distance, 180 - distance)
     mask = ((distance <= tolerance) & (hsv[..., 1] >= max(35, int(sat * .45)))
-            & (hsv[..., 2] >= max(20, int(val * .3)))).astype(np.uint8) * 255
+            & (hsv[..., 2] >= max(20, int(val * .12)))).astype(np.uint8) * 255
     x, y, w, h = roi
     outside = np.zeros_like(mask)
     outside[y:y+h, x:x+w] = mask[y:y+h, x:x+w]
@@ -56,16 +64,18 @@ def color_mask(frame, target, tolerance, roi):
                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
 
-def marker_chain(frame, settings):
+def marker_chain(frame, settings, previous=None, hue_offset=0):
     """Locate colored discs along image x; returns left-to-right centers."""
     roi = settings["roi"]
     x0, y0, width, height = roi
-    blue_hue, green_hue = settings["blue_hsv"][0], settings["green_hsv"][0]
+    blue_target = ((settings["blue_hsv"][0] + hue_offset) % 180, *settings["blue_hsv"][1:])
+    green_target = ((settings["green_hsv"][0] + hue_offset) % 180, *settings["green_hsv"][1:])
+    blue_hue, green_hue = blue_target[0], green_target[0]
     hue_gap = min(abs(blue_hue-green_hue), 180-abs(blue_hue-green_hue))
     distinct_tip = hue_gap >= 16
-    blue_mask = color_mask(frame, settings["blue_hsv"],
+    blue_mask = color_mask(frame, blue_target,
                            min(15, hue_gap-6) if distinct_tip else 15, roi)
-    green_mask = color_mask(frame, settings["green_hsv"], 7, roi)
+    green_mask = color_mask(frame, green_target, 7, roi)
     mask = blue_mask if distinct_tip else cv2.bitwise_or(blue_mask, green_mask)
     region = mask[y0:y0+height, x0:x0+width]
     projection = (region > 0).sum(axis=0).astype(np.float32)
@@ -79,13 +89,14 @@ def marker_chain(frame, settings):
     for _strength, x in sorted(candidates, reverse=True):
         if all(abs(x-other) >= separation for other in peaks):
             peaks.append(x)
-    if len(peaks) > MARKER_COUNT:
+    peak_limit = MARKER_COUNT-1 if distinct_tip else MARKER_COUNT
+    if len(peaks) > peak_limit:
         from itertools import combinations
         strengths = {x: float(projection[x]) for x in peaks}
         def regularity(selected):
             gaps = np.diff(sorted(selected)).astype(float)
             return float(np.sum(np.diff(np.log(gaps))**2)) - .001 * sum(strengths[x] for x in selected)
-        peaks = list(min(combinations(peaks, MARKER_COUNT), key=regularity))
+        peaks = list(min(combinations(peaks, peak_limit), key=regularity))
     if len(peaks) < 7:
         return [], f"markers {len(peaks)}/{MARKER_COUNT}"
     points = []
@@ -106,19 +117,52 @@ def marker_chain(frame, settings):
         for contour in contours:
             area = cv2.contourArea(contour)
             x, y, w, h = cv2.boundingRect(contour)
-            if area < 100 or w < 8 or h < 8 or max(w/h, h/w) > 2.5:
+            if area < 100 or area > 3000 or w < 8 or h < 8 or max(w/h, h/w) > 2.5:
                 continue
             moments = cv2.moments(contour)
             if moments["m00"]:
                 center = (moments["m10"]/moments["m00"], moments["m01"]/moments["m00"])
-                if center[0] < points[0][0]-7:
+                gap = points[0][0]-center[0]
+                expected_y = points[0][1]
+                if len(points) > 1:
+                    expected_y += (points[0][1]-points[1][1])*gap/(points[1][0]-points[0][0])
+                if 7 < gap < 110 and abs(center[1]-expected_y) < 55:
                     tips.append((area, center))
         if not tips:
             return [], "green tip not found"
-        points.insert(0, max(tips, key=lambda item: item[0])[1])
+        if previous is not None:
+            tips.sort(key=lambda item: np.linalg.norm(np.subtract(item[1], previous[0])))
+        else:
+            tips.sort(key=lambda item: (abs((points[0][0]-item[1][0]) - 25), -item[0]))
+        points.insert(0, tips[0][1])
     if len(points) < 7:
         return [], f"markers {len(points)}/{MARKER_COUNT}"
     return points, f"markers {len(points)}/{MARKER_COUNT}"
+
+
+def follow_markers(frame, settings, previous, hue_offset):
+    """Find each known marker in a small window around its last location."""
+    blue_target = ((settings["blue_hsv"][0]+hue_offset) % 180, *settings["blue_hsv"][1:])
+    green_target = ((settings["green_hsv"][0]+hue_offset) % 180, *settings["green_hsv"][1:])
+    blue_mask = color_mask(frame, blue_target, 13, settings["roi"])
+    green_mask = color_mask(frame, green_target, 9, settings["roi"])
+    height, width = frame.shape[:2]
+    found = []
+    for index, (x, y) in enumerate(previous):
+        x, y = int(round(x)), int(round(y))
+        neighbors = [abs(x-previous[j][0]) for j in (index-1, index+1)
+                     if 0 <= j < len(previous)]
+        radius_x = min(20, max(10, int(min(neighbors)*.45)))
+        radius_y = 27
+        x0, x1 = max(0, x-radius_x), min(width, x+radius_x+1)
+        y0, y1 = max(0, y-radius_y), min(height, y+radius_y+1)
+        mask = green_mask if index == 0 else blue_mask
+        ys, xs = np.nonzero(mask[y0:y1, x0:x1])
+        if len(xs) < (18 if index == 0 else 45):
+            found.append(None)
+        else:
+            found.append((float(x0+np.median(xs)), float(y0+np.median(ys))))
+    return found
 
 
 def turning_angles(points):
@@ -198,6 +242,72 @@ class BendingOverlay:
         self.enabled = enabled
         self.settings = None
         self.shape = None
+        self.last_points = None
+        self.missed = None
+        self.hue_offset = 0
+
+    def _current_hue_offset(self, frame):
+        """Sample known blue discs so camera auto exposure cannot stale the saved hue."""
+        if self.last_points is None:
+            return self.hue_offset
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        height, width = hsv.shape[:2]
+        hues = []
+        for x, y in self.last_points[1:]:
+            x, y = int(round(x)), int(round(y))
+            patch = hsv[max(0, y-4):min(height, y+5), max(0, x-4):min(width, x+5)]
+            pixels = patch[(patch[..., 1] >= 55) & (patch[..., 2] >= 20)]
+            if len(pixels) >= 8:
+                hues.append(float(np.median(pixels[:, 0])))
+        if len(hues) >= 4:
+            self.hue_offset = int(np.clip(np.median(hues)-self.settings["blue_hsv"][0], -25, 25))
+        return self.hue_offset
+
+    def _stable_points(self, detected):
+        if self.last_points is None:
+            if len(detected) != MARKER_COUNT:
+                return None, f"{len(detected)}/{MARKER_COUNT}; waiting for full chain"
+            self.last_points = np.asarray(detected, float)
+            self.missed = np.zeros(MARKER_COUNT, int)
+            return self.last_points.copy(), "10/10"
+        updated = self.last_points.copy()
+        used = set()
+        for point in detected:
+            distances = np.linalg.norm(self.last_points-np.asarray(point), axis=1)
+            choices = [(distances[i], i) for i in range(MARKER_COUNT) if i not in used]
+            if not choices:
+                break
+            distance, index = min(choices)
+            if distance <= 50:
+                updated[index] = .65*self.last_points[index] + .35*np.asarray(point)
+                self.missed[index] = 0
+                used.add(index)
+        for index in range(MARKER_COUNT):
+            if index not in used:
+                self.missed[index] += 1
+        if np.any(self.missed > 4):
+            self.last_points = self.missed = None
+            return None, "tracking lost; reacquiring markers"
+        self.last_points = updated
+        held = MARKER_COUNT-len(used)
+        return updated.copy(), "10/10" if not held else f"{len(used)}/10 visible; {held} held"
+
+    def _stable_indexed(self, detected):
+        updated = self.last_points.copy()
+        visible = 0
+        for index, point in enumerate(detected):
+            if point is not None and np.linalg.norm(self.last_points[index]-point) <= 45:
+                updated[index] = .65*self.last_points[index]+.35*np.asarray(point)
+                self.missed[index] = 0
+                visible += 1
+            else:
+                self.missed[index] += 1
+        if np.any(self.missed > 5):
+            self.last_points = self.missed = None
+            return None, "tracking lost; reacquiring markers"
+        self.last_points = updated
+        return updated.copy(), ("10/10" if visible == 10 else
+                                f"{visible}/10 visible; {10-visible} held")
 
     def draw(self, image, frame, depth, vision):
         if not self.enabled:
@@ -205,12 +315,31 @@ class BendingOverlay:
         if self.shape != image.shape[:2]:
             self.shape = image.shape[:2]
             self.settings = load_settings(image.shape)
+            self.last_points = self.missed = None
+            self.hue_offset = 0
+            if self.settings is not None and self.settings.get("reference_points") is not None:
+                self.last_points = np.asarray(self.settings["reference_points"], float)
+                self.missed = np.zeros(MARKER_COUNT, int)
         if self.settings is None:
             self._text(image, "Bending: run `python nus_main.py bending-setup`", 0)
             return image
-        points, status = marker_chain(frame, self.settings)
-        if not points:
-            self._text(image, "Bending: " + status, 0)
+        offset = self._current_hue_offset(frame)
+        if self.last_points is not None:
+            detected = follow_markers(frame, self.settings, self.last_points, offset)
+            detection_status = f"local {sum(p is not None for p in detected)}/10"
+            points, status = self._stable_indexed(detected)
+        else:
+            detected, detection_status = [], "markers 0/10"
+            for candidate_offset in (offset, offset+10, offset-10):
+                candidate, candidate_status = marker_chain(frame, self.settings, None, candidate_offset)
+                if len(candidate) > len(detected):
+                    detected, detection_status = candidate, candidate_status
+                    self.hue_offset = candidate_offset
+                if len(candidate) == MARKER_COUNT:
+                    break
+            points, status = self._stable_points(detected)
+        if points is None:
+            self._text(image, "Bending: " + status + " (" + detection_status + ")", 0)
             return image
         base = tuple(self.settings["base"])
         if base[0] <= points[-1][0]:
@@ -266,8 +395,14 @@ def run_setup(camera):
         nonlocal note
         if roi is not None and base is not None:
             try:
-                save_settings(frame.shape, roi, base, blue_hsv, green_hsv)
-                note = "Saved calibration; q to quit or adjust selections"
+                current = {"roi": roi, "blue_hsv": blue_hsv, "green_hsv": green_hsv}
+                reference, _ = marker_chain(frame, current)
+                if len(reference) != MARKER_COUNT and existing is not None:
+                    reference = existing.get("reference_points", [])
+                save_settings(frame.shape, roi, base, blue_hsv, green_hsv,
+                              reference_points=reference if len(reference) == MARKER_COUNT else None)
+                note = ("Saved 10 marker positions; q to quit" if len(reference) == MARKER_COUNT
+                        else "Saved colors/ROI; show all 10 markers and press s to save positions")
             except OSError as exc:
                 note = f"Could not save calibration: {exc}"
 
@@ -309,6 +444,8 @@ def run_setup(camera):
             if key in (ord("a"), ord("b"), ord("g")):
                 mode = chr(key)
                 note = f"Click {'base' if mode == 'a' else 'blue marker' if mode == 'b' else 'green tip'}"
+            if key == ord("s"):
+                persist()
             if key == ord("r"):
                 selected = cv2.selectROI(window, frame, False, False)
                 if selected[2] and selected[3]:

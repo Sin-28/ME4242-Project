@@ -6,7 +6,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from nus_bending import (BendingOverlay, load_settings, marker_chain, save_settings,
+from nus_bending import (BendingOverlay, follow_markers, load_settings, marker_chain, save_settings,
                          spatial_angles, split_two_bends, turning_angles)
 
 
@@ -78,6 +78,29 @@ class BendingTests(unittest.TestCase):
         self.assertEqual(len(points), 10, status)
         self.assertAlmostEqual(points[0][0], 50, delta=3)
         self.assertAlmostEqual(points[1][0], 72, delta=3)
+
+    def test_local_tracking_ignores_neighbor_and_adapts_to_darker_frame(self):
+        height, width = 240, 650
+        centers = [(50, 120)] + [(x, 120) for x in (72, 125, 180, 235, 290, 345, 400, 455, 510)]
+        settings = {"roi": [30, 80, 510, 90], "base": [600, 120],
+                    "blue_hsv": [101, 150, 220], "green_hsv": [60, 150, 220],
+                    "reference_points": centers}
+        hsv = np.zeros((height, width, 3), np.uint8)
+        hsv[:] = (0, 0, 110)
+        cv2.circle(hsv, centers[0], 9, (70, 145, 75), -1)
+        for point in centers[1:]:
+            cv2.circle(hsv, point, 9, (111, 145, 65), -1)
+        cv2.circle(hsv, (50, 72), 9, (70, 145, 75), -1)  # moving object, not the tip
+        frame = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        overlay = BendingOverlay(enabled=True)
+        overlay.settings = settings
+        overlay.last_points = np.asarray(centers, float)
+        overlay.missed = np.zeros(10, int)
+        self.assertEqual(overlay._current_hue_offset(frame), 10)
+        detected = follow_markers(frame, settings, overlay.last_points, overlay.hue_offset)
+        self.assertTrue(all(point is not None for point in detected))
+        self.assertAlmostEqual(detected[0][0], centers[0][0], delta=2)
+        self.assertAlmostEqual(detected[0][1], centers[0][1], delta=2)
 
 
 if __name__ == "__main__":

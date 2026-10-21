@@ -20,7 +20,8 @@ all nine blue discs **throughout their expected movement**. The fixed base mount
 can stay outside the ROI. Press `a`, then click the point where the rod leaves
 the mount. If the default colors do not detect the discs, press `b` and click
 the center of one blue disc; press `g` and click the green tip. Press `q` to
-finish. The settings are saved in ignored `bending_config.json` and reused when
+finish. With all ten discs visible, press `s` to save their reference positions.
+The settings are saved in ignored `bending_config.json` and reused when
 the frame size matches. Run setup again if the camera or mount moves.
 
 ## Turn it on and off
