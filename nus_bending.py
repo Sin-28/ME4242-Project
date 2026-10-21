@@ -202,8 +202,7 @@ def valid_chain(points, base):
         return False
     ordered = np.asarray(points, float)
     gaps = np.linalg.norm(np.diff(ordered, axis=0), axis=1)
-    return bool(np.all(np.isfinite(ordered)) and np.all(gaps >= 7)
-                and np.all(np.diff(ordered[:, 0]) > 5))
+    return bool(np.all(np.isfinite(ordered)) and np.all(gaps >= 7))
 
 
 def effective_base(settings, points):
@@ -240,7 +239,9 @@ def bend_sections(points, min_bend=15.0):
     Adjacent turns in the same direction belong to one bend. A reversal starts
     another section; small color/depth jitter is ignored.
     """
-    vectors = np.diff(np.asarray(points, float), axis=0)
+    positions = np.asarray(points, float)
+    # Central chords suppress per-marker pixel jitter while preserving bends.
+    vectors = positions[2:]-positions[:-2]
     lengths = np.linalg.norm(vectors, axis=1)
     if len(vectors) < 2 or np.any(lengths < 3):
         return []
@@ -257,7 +258,7 @@ def bend_sections(points, min_bend=15.0):
         directions = crosses / np.maximum(np.linalg.norm(crosses, axis=1)[:, None], 1e-9)
     groups = []
     for index, magnitude in enumerate(magnitudes):
-        if magnitude < 2.5:
+        if magnitude < 3.5:
             continue
         direction = directions[index]
         same = bool(groups) and (directions[groups[-1][-1]]*direction > 0
@@ -269,10 +270,14 @@ def bend_sections(points, min_bend=15.0):
             groups.append([index])
     sections = []
     for group in groups:
-        angle = float(np.sum(magnitudes[group]))
-        if angle >= min_bend:
-            sign = float(directions[group[0]]) if unit.shape[1] == 2 else 1.0
-            sections.append((group[0], group[-1]+2, sign*angle))
+        first, last = group[0], group[-1]+1
+        if unit.shape[1] == 2:
+            a, b = unit[first], unit[last]
+            angle = math.degrees(math.atan2(a[0]*b[1]-a[1]*b[0], float(np.dot(a, b))))
+        else:
+            angle = angle_between(unit[first], unit[last])
+        if abs(angle) >= min_bend:
+            sections.append((first, last+2, float(angle)))
     return sections
 
 
@@ -345,6 +350,7 @@ class BendingOverlay:
         self.last_points = None
         self.missed = None
         self.hue_offset = 0
+        self.prev_gray = None
 
     def _recover(self, frame):
         """Retry the saved straight pose and the original hue after tracking loss."""
@@ -421,13 +427,13 @@ class BendingOverlay:
         updated = self.last_points.copy()
         visible = 0
         for index, point in enumerate(detected):
-            if point is not None and np.linalg.norm(self.last_points[index]-point) <= 45:
+            if point is not None and np.linalg.norm(self.last_points[index]-point) <= 100:
                 updated[index] = .65*self.last_points[index]+.35*np.asarray(point)
                 self.missed[index] = 0
                 visible += 1
             else:
                 self.missed[index] += 1
-        if np.any(self.missed > 5) or not valid_chain(updated, self.settings["base"]):
+        if np.any(self.missed > 15) or not valid_chain(updated, self.settings["base"]):
             self.last_points = self.missed = None
             return None, "tracking lost; reacquiring markers"
         self.last_points = updated
@@ -437,11 +443,15 @@ class BendingOverlay:
     def draw(self, image, frame, depth, vision):
         if not self.enabled:
             return image
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        previous_gray = self.prev_gray
+        self.prev_gray = gray
         if self.shape != image.shape[:2]:
             self.shape = image.shape[:2]
             self.settings = load_settings(image.shape)
             self.last_points = self.missed = None
             self.hue_offset = 0
+            previous_gray = None
             if self.settings is not None and self.settings.get("reference_points") is not None:
                 self.last_points = np.asarray(self.settings["reference_points"], float)
                 self.missed = np.zeros(MARKER_COUNT, int)
@@ -450,7 +460,17 @@ class BendingOverlay:
             return image
         offset = self._current_hue_offset(frame)
         if self.last_points is not None:
-            detected = follow_markers(frame, self.settings, self.last_points, offset, self.missed)
+            predicted = self.last_points.copy()
+            if previous_gray is not None and previous_gray.shape == gray.shape:
+                flowed, status_flow, _ = cv2.calcOpticalFlowPyrLK(
+                    previous_gray, gray, self.last_points.astype(np.float32).reshape(-1, 1, 2),
+                    None, winSize=(31, 31), maxLevel=3)
+                if flowed is not None:
+                    flowed = flowed.reshape(-1, 2)
+                    good = (status_flow.ravel() != 0) & (
+                        np.linalg.norm(flowed-self.last_points, axis=1) < 120)
+                    predicted[good] = flowed[good]
+            detected = follow_markers(frame, self.settings, predicted, offset, self.missed)
             detection_status = f"local {sum(p is not None for p in detected)}/10"
             points, status = self._stable_indexed(detected)
             if points is None:
@@ -464,6 +484,9 @@ class BendingOverlay:
         base = effective_base(self.settings, points)
         ordered = [base] + list(points[::-1])
         self._draw_chain(image, ordered)
+        if self.missed is not None and np.any(self.missed):
+            self._text(image, f"Bending: {status} | angle paused until markers return", 0)
+            return image
         try:
             turns = turning_angles(ordered)
         except ValueError as exc:
@@ -490,19 +513,19 @@ class BendingOverlay:
 
     @staticmethod
     def _label(image, label, position):
-        cv2.putText(image, label, position, cv2.FONT_HERSHEY_SIMPLEX, .58, (0, 0, 0), 4)
-        cv2.putText(image, label, position, cv2.FONT_HERSHEY_SIMPLEX, .58, (0, 255, 255), 2)
+        cv2.putText(image, label, position, cv2.FONT_HERSHEY_SIMPLEX, .48, (0, 0, 0), 2)
+        cv2.putText(image, label, position, cv2.FONT_HERSHEY_SIMPLEX, .48, (0, 255, 255), 1)
 
     def _draw_chain(self, image, ordered):
         """Draw markers, path and tip directly at their measured image positions."""
-        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 0, 0), 7)
-        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 255, 255), 3)
-        cv2.circle(image, tuple(map(int, ordered[0])), 12, (0, 0, 255), 3)
+        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 0, 0), 3)
+        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 255, 255), 1)
+        cv2.circle(image, tuple(map(int, ordered[0])), 9, (0, 0, 255), 1)
         for index, point in enumerate(ordered[1:], 1):
             center = tuple(np.rint(point).astype(int))
             color = (0, 255, 0) if index == MARKER_COUNT else (255, 100, 0)
-            cv2.circle(image, center, 13, (0, 0, 0), 6)
-            cv2.circle(image, center, 13, color, 4)
+            cv2.circle(image, center, 9, (0, 0, 0), 3)
+            cv2.circle(image, center, 9, color, 1)
             self._label(image, "TIP" if index == MARKER_COUNT else str(index),
                         (center[0]+12, center[1]-12))
 

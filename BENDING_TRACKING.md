@@ -68,14 +68,17 @@ each detected bend separately (`B1`, `B2`, etc.). Signed 2D angles use `+` for
 clockwise motion on screen. With valid depth at every marker, it also estimates
 unsigned 3D bend angles, including motion toward or away from the camera.
 Missing depth leaves the 2D measurement and a depth status visible. Angles are
-shown only when the full ten-marker chain is tracked; briefly held positions
-can appear during occlusion. After tracking loss, the overlay retries the saved
+shown only when all ten markers are visible; held positions remain outlined
+briefly during occlusion, with angle measurement paused. After tracking loss, the overlay retries the saved
 reference pose and original marker colors automatically. The tracking area
 extends to the saved base position even if the selected ROI ended before the
-base-side blue marker.
+base-side blue marker. Optical flow predicts marker positions between frames so
+fast bending can move beyond the local color search window.
 
-The marker ordering assumes the base is to the right of the tip in the image
-and the rod does not fold backward in image x. The dedicated `--depth` preview
+The initial marker ordering assumes the base is to the right of the tip in the
+image. Local tracking can follow a brief reversal in image x, but a full
+reacquisition still needs the markers to separate across the image. The
+dedicated `--depth` preview
 aligns depth to color and deprojects each marker using RealSense intrinsics.
 The regular N-U-S commands use the existing `emioapi` camera calibration and
 millimeter depth frame without explicit pixel alignment, so those 3D values

@@ -157,6 +157,33 @@ class BendingTests(unittest.TestCase):
         points, status = marker_chain(frame, settings)
         self.assertEqual(len(points), 10, status)
 
+    def test_pixel_jitter_does_not_inflate_bend_angle(self):
+        points = [(i*45, 200+(2 if i % 2 else -2)) for i in range(11)]
+        self.assertGreater(np.abs(turning_angles(points)).sum(), 80)
+        self.assertEqual(bend_sections(points), [])
+
+    def test_chain_can_curve_back_in_image_x(self):
+        points = [(40+i*35-10*max(0, i-5), 200+i*12) for i in range(10)]
+        points[7] = (points[6][0]-2, points[7][1])
+        self.assertTrue(valid_chain(points, (500, 200)))
+
+    def test_optical_flow_follows_large_frame_to_frame_motion(self):
+        frame, settings = self.frame_and_settings()
+        points, _ = marker_chain(frame, settings)
+        settings["reference_points"] = points
+        overlay = BendingOverlay(True)
+        overlay.settings = settings
+        overlay.shape = frame.shape[:2]
+        overlay.last_points = np.asarray(points, float)
+        overlay.missed = np.zeros(10, int)
+        overlay.draw(frame.copy(), frame, None, None)
+        shifted = cv2.warpAffine(frame, np.float32([[1, 0, 0], [0, 1, 42]]),
+                                 (frame.shape[1], frame.shape[0]), borderValue=(110, 110, 110))
+        for _ in range(7):
+            overlay.draw(shifted.copy(), shifted, None, None)
+        self.assertTrue(np.all(overlay.missed == 0))
+        self.assertGreater(np.mean(overlay.last_points[:, 1]-np.asarray(points)[:, 1]), 38)
+
 
 if __name__ == "__main__":
     unittest.main()
