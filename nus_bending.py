@@ -1,12 +1,14 @@
-"""Optional, read-only 2D bending overlay for color camera frames."""
+"""Optional, read-only bending overlay for the existing EMIO color/depth frames."""
 
 import json
+import math
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 CONFIG_PATH = Path(__file__).with_name("bending_config.json")
+DEPTH_CONFIG_PATH = Path(__file__).with_name("bending_depth_config.json")
 BLUE_HSV = (112, 120, 80)
 GREEN_HSV = (101, 70, 75)
 MARKER_COUNT = 10  # nine blue discs and one green tip
@@ -35,18 +37,25 @@ def load_settings(shape, path=CONFIG_PATH):
                                                                    0 <= point[1] < height)
                                           for point in reference)):
             return None
+        depths = settings.get("reference_depth_mm")
+        if depths is not None and (len(depths) != MARKER_COUNT or
+                                   any(not isinstance(value, (int, float)) or value <= 0
+                                       or value >= 2000 for value in depths)):
+            return None
         return settings
     except (OSError, ValueError, TypeError, KeyError, IndexError):
         return None
 
 
 def save_settings(shape, roi, base, blue_hsv, green_hsv, path=CONFIG_PATH,
-                  reference_points=None):
+                  reference_points=None, reference_depth_mm=None):
     height, width = shape[:2]
     data = {"frame_size": [width, height], "roi": list(roi), "base": list(base),
             "blue_hsv": list(blue_hsv), "green_hsv": list(green_hsv)}
     if reference_points is not None:
         data["reference_points"] = [list(point) for point in reference_points]
+    if reference_depth_mm is not None:
+        data["reference_depth_mm"] = [float(value) for value in reference_depth_mm]
     Path(path).write_text(json.dumps(data, indent=2) + "\n")
 
 
@@ -140,13 +149,16 @@ def marker_chain(frame, settings, previous=None, hue_offset=0):
     return points, f"markers {len(points)}/{MARKER_COUNT}"
 
 
-def follow_markers(frame, settings, previous, hue_offset):
+def follow_markers(frame, settings, previous, hue_offset, depth=None, expected_depths=None):
     """Find each known marker in a small window around its last location."""
     blue_target = ((settings["blue_hsv"][0]+hue_offset) % 180, *settings["blue_hsv"][1:])
     green_target = ((settings["green_hsv"][0]+hue_offset) % 180, *settings["green_hsv"][1:])
     blue_mask = color_mask(frame, blue_target, 13, settings["roi"])
     green_mask = color_mask(frame, green_target, 9, settings["roi"])
     height, width = frame.shape[:2]
+    if depth is not None:
+        if depth.shape != (height, width) or expected_depths is None or len(expected_depths) != len(previous):
+            raise ValueError("aligned depth and per-marker reference depths required")
     found = []
     for index, (x, y) in enumerate(previous):
         x, y = int(round(x)), int(round(y))
@@ -158,6 +170,11 @@ def follow_markers(frame, settings, previous, hue_offset):
         y0, y1 = max(0, y-radius_y), min(height, y+radius_y+1)
         mask = green_mask if index == 0 else blue_mask
         local = mask[y0:y1, x0:x1]
+        if depth is not None:
+            expected = expected_depths[index]
+            local_depth = depth[y0:y1, x0:x1]
+            local = local & np.where((local_depth > 0) &
+                                     (np.abs(local_depth-expected) <= 40), 255, 0).astype(np.uint8)
         ys, xs = np.nonzero(local)
         if len(xs) < (18 if index == 0 else 45):
             found.append(None)
@@ -194,7 +211,7 @@ def bend_sections(points, min_bend=15.0):
     """Return independent bends as (first marker, last marker, angle).
 
     Adjacent turns in the same direction belong to one bend. A reversal starts
-    another section; small color jitter is ignored.
+    another section; small color/depth jitter is ignored.
     """
     vectors = np.diff(np.asarray(points, float), axis=0)
     lengths = np.linalg.norm(vectors, axis=1)
@@ -232,28 +249,98 @@ def bend_sections(points, min_bend=15.0):
     return sections
 
 
+def spatial_points(points, depth, pixel_to_robot):
+    if depth is None or depth.ndim != 2 or pixel_to_robot is None:
+        return None, "depth unavailable"
+    xyz = []
+    for x, y in points:
+        value = depth_at(depth, (x, y))
+        xyz.append(None if value is None else np.asarray(pixel_to_robot(x, y, value), float))
+    valid = sum(point is not None and np.all(np.isfinite(point)) for point in xyz)
+    if valid != len(points):
+        return None, f"depth {valid}/{len(points)}; showing 2D"
+    return np.asarray(xyz), "3D depth ready"
+
+
+def depth_at(depth, point):
+    x, y = (int(round(v)) for v in point)
+    height, width = depth.shape
+    for radius in (4, 8, 14):
+        x0, x1 = max(0, x-radius), min(width, x+radius+1)
+        y0, y1 = max(0, y-radius), min(height, y+radius+1)
+        if x0 >= x1 or y0 >= y1:
+            return None
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        values = depth[y0:y1, x0:x1][(xx-x)**2+(yy-y)**2 <= radius**2]
+        values = values[(values > 0) & (values < 2000)]  # emioapi supplies millimeters
+        if len(values) >= 5:
+            return float(np.median(values))
+    return None
+
+
+def angle_between(a, b):
+    return math.degrees(math.acos(np.clip(float(np.dot(a, b) /
+                                               (np.linalg.norm(a)*np.linalg.norm(b))), -1, 1)))
+
+
+def spatial_angles(points, bend, depth, pixel_to_robot):
+    if depth is None or depth.ndim != 2:
+        return None, "depth unavailable"
+    xyz = []
+    for x, y in points:
+        value = depth_at(depth, (x, y))
+        xyz.append(None if value is None else np.asarray(pixel_to_robot(x, y, value), float))
+    valid = sum(point is not None and np.all(np.isfinite(point)) for point in xyz)
+    if valid != len(points):
+        return None, f"depth {valid}/{len(points)}; showing 2D"
+    xyz = np.asarray(xyz)
+    def section(start, end):
+        if end-start < 2:
+            return None
+        first, last = xyz[start+2]-xyz[start], xyz[end]-xyz[end-2]
+        if min(np.linalg.norm(first), np.linalg.norm(last)) < 1e-5:
+            return None
+        return angle_between(first, last)
+    if bend is None:
+        value = section(0, len(points)-1)
+        return (value,), f"3D {value:.1f} deg" if value is not None else "depth geometry invalid"
+    cut = bend[0]
+    values = (section(0, cut+1), section(cut, len(points)-1))
+    return values, (f"3D base {values[0]:.1f} | tip {values[1]:.1f} deg"
+                    if None not in values else "depth geometry invalid")
+
+
 class BendingOverlay:
-    def __init__(self, enabled=False, config_path=CONFIG_PATH):
+    def __init__(self, enabled=False, config_path=CONFIG_PATH, depth_tracking=False):
         self.enabled = enabled
         self.config_path = config_path
+        self.depth_tracking = depth_tracking
+        self.marker_depths = None
         self.settings = None
         self.shape = None
         self.last_points = None
         self.missed = None
         self.hue_offset = 0
 
-    def _recover(self, frame):
+    def _recover(self, frame, depth=None):
         """Retry the saved straight pose and the original hue after tracking loss."""
         reference = self.settings.get("reference_points")
         if reference is not None:
             previous = np.asarray(reference, float)
             for offset in (self.hue_offset, 0, 10, -10, 20, -20):
-                found = follow_markers(frame, self.settings, previous, offset)
+                found = follow_markers(frame, self.settings, previous, offset,
+                                       depth if self.depth_tracking else None,
+                                       self.settings.get("reference_depth_mm") if self.depth_tracking else None)
                 if all(point is not None for point in found):
                     self.last_points = np.asarray(found, float)
                     self.missed = np.zeros(MARKER_COUNT, int)
                     self.hue_offset = offset
+                    if self.depth_tracking:
+                        self.marker_depths = [depth_at(depth, point) or saved for point, saved in
+                                              zip(found, self.settings["reference_depth_mm"])]
                     return self.last_points.copy(), "10/10 reacquired"
+        if self.depth_tracking:
+            return None, "depth-validated markers not found near saved positions"
         best, status = [], "markers 0/10"
         for offset in dict.fromkeys((self.hue_offset, 0, 5, -5, 10, -10, 15, -15, 20, -20)):
             candidate, candidate_status = marker_chain(frame, self.settings, None, offset)
@@ -312,13 +399,17 @@ class BendingOverlay:
         held = MARKER_COUNT-len(used)
         return updated.copy(), "10/10" if not held else f"{len(used)}/10 visible; {held} held"
 
-    def _stable_indexed(self, detected):
+    def _stable_indexed(self, detected, depth=None):
         updated = self.last_points.copy()
         visible = 0
         for index, point in enumerate(detected):
             if point is not None and np.linalg.norm(self.last_points[index]-point) <= 45:
                 updated[index] = .65*self.last_points[index]+.35*np.asarray(point)
                 self.missed[index] = 0
+                if self.depth_tracking:
+                    measured = depth_at(depth, point)
+                    if measured is not None:
+                        self.marker_depths[index] = .7*self.marker_depths[index]+.3*measured
                 visible += 1
             else:
                 self.missed[index] += 1
@@ -329,7 +420,7 @@ class BendingOverlay:
         return updated.copy(), ("10/10" if visible == 10 else
                                 f"{visible}/10 visible; {10-visible} held")
 
-    def draw(self, image, frame, _depth=None, _vision=None):
+    def draw(self, image, frame, depth, vision):
         if not self.enabled:
             return image
         if self.shape != image.shape[:2]:
@@ -337,21 +428,33 @@ class BendingOverlay:
             self.settings = load_settings(image.shape, self.config_path)
             self.last_points = self.missed = None
             self.hue_offset = 0
+            self.marker_depths = None
             if self.settings is not None and self.settings.get("reference_points") is not None:
                 self.last_points = np.asarray(self.settings["reference_points"], float)
                 self.missed = np.zeros(MARKER_COUNT, int)
+                if self.depth_tracking and self.settings.get("reference_depth_mm") is not None:
+                    self.marker_depths = list(self.settings["reference_depth_mm"])
         if self.settings is None:
             self._text(image, "Bending: run `python nus_main.py bending-setup`", 0)
             return image
+        if self.depth_tracking:
+            if depth is None or depth.shape != frame.shape[:2]:
+                self._text(image, "Bending: aligned depth frame required", 0)
+                return image
+            if self.marker_depths is None:
+                self._text(image, "Bending: run depth setup and click all 10 markers", 0)
+                return image
         offset = self._current_hue_offset(frame)
         if self.last_points is not None:
-            detected = follow_markers(frame, self.settings, self.last_points, offset)
+            detected = follow_markers(frame, self.settings, self.last_points, offset,
+                                      depth if self.depth_tracking else None,
+                                      self.marker_depths if self.depth_tracking else None)
             detection_status = f"local {sum(p is not None for p in detected)}/10"
-            points, status = self._stable_indexed(detected)
+            points, status = self._stable_indexed(detected, depth)
             if points is None:
-                points, status = self._recover(frame)
+                points, status = self._recover(frame, depth)
         else:
-            points, status = self._recover(frame)
+            points, status = self._recover(frame, depth)
             detection_status = status
         if points is None:
             reference = self.settings.get("reference_points", [])
@@ -372,6 +475,12 @@ class BendingOverlay:
         sections_2d = bend_sections(ordered, min_bend=5.0)
         two_d = ("2D " + (" | ".join(f"B{i} {angle:+.1f} deg" for i, (_, _, angle)
                                     in enumerate(sections_2d, 1)) if sections_2d else "straight"))
+        converter = vision.pixel_to_robot if vision is not None else None
+        xyz, depth_status = spatial_points(ordered, depth, converter)
+        if xyz is not None:
+            sections_3d = bend_sections(xyz)
+            depth_status = ("3D " + (" | ".join(f"B{i} {angle:.1f} deg" for i, (_, _, angle)
+                                             in enumerate(sections_3d, 1)) if sections_3d else "straight"))
         cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 0, 0), 6)
         cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 255, 255), 3)
         cv2.circle(image, tuple(map(int, base)), 12, (0, 0, 255), 3)
@@ -396,6 +505,7 @@ class BendingOverlay:
             cv2.putText(image, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
                         .68, (0, 255, 255), 2)
         self._text(image, f"Bending: {status} | {two_d}", 0)
+        self._text(image, depth_status, 1)
         return image
 
     @staticmethod
@@ -445,7 +555,7 @@ def draw_reference_markers(image, points, prefix=""):
                     cv2.FONT_HERSHEY_SIMPLEX, .55, color, 2)
 
 
-def run_setup(camera, config_path=CONFIG_PATH):
+def run_setup(camera, config_path=CONFIG_PATH, depth_mode=False):
     """Interactive ROI, base, and one-by-one marker calibration."""
     window = "Bending setup (r ROI, a base, g tip, b blue x9, u undo, s save, q quit)"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
@@ -463,10 +573,20 @@ def run_setup(camera, config_path=CONFIG_PATH):
             note = "Select ROI (r) and base (a) before saving"
             return
         try:
+            depths = None
+            if depth_mode and len(manual_points) == MARKER_COUNT:
+                depths = [depth_at(camera.depth_frame, point) for point in manual_points]
+                if any(value is None for value in depths):
+                    depths = None
             save_settings(frame.shape, roi, base, blue_hsv, green_hsv, config_path,
-                          reference_points=manual_points if len(manual_points) == MARKER_COUNT else None)
-            note = ("Saved T + B1-B9 reference points" if len(manual_points) == MARKER_COUNT
-                    else f"Saved ROI/base/colors; click {MARKER_COUNT-len(manual_points)} more markers")
+                          reference_points=manual_points if len(manual_points) == MARKER_COUNT else None,
+                          reference_depth_mm=depths)
+            if depth_mode and len(manual_points) == MARKER_COUNT:
+                note = ("Saved 10 markers with aligned depth" if depths is not None else
+                        "Depth missing at a marker; adjust camera and press s again")
+            else:
+                note = ("Saved T + B1-B9 reference points" if len(manual_points) == MARKER_COUNT
+                        else f"Saved ROI/base/colors; click {MARKER_COUNT-len(manual_points)} more markers")
         except OSError as exc:
             note = f"Could not save calibration: {exc}"
 
@@ -545,7 +665,7 @@ def run_setup(camera, config_path=CONFIG_PATH):
 
 
 class RGBCamera:
-    """OpenCV color camera for 2D setup and preview."""
+    """OpenCV color-only camera for setup/preview when the depth SDK is unavailable."""
     def __init__(self, index=0):
         self.capture = cv2.VideoCapture(index)
         if not self.capture.isOpened():
@@ -561,17 +681,19 @@ class RGBCamera:
         self.capture.release()
 
 
-def run_preview(camera, config_path=CONFIG_PATH):
+def run_preview(camera, config_path=CONFIG_PATH, depth_mode=False):
     """Preview marker tracking without motor control."""
-    window = "Bending RGB preview (m setup, v toggle, q quit)"
+    window = "Bending depth preview (m setup, v toggle, q quit)" if depth_mode else "Bending RGB preview (m setup, v toggle, q quit)"
     print(f"Opening preview window: {window}", flush=True)
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    overlay = BendingOverlay(enabled=True, config_path=config_path)
+    overlay = BendingOverlay(enabled=True, config_path=config_path, depth_tracking=depth_mode)
     try:
         while True:
             camera.update()
             frame = camera.frame.copy()
-            overlay.draw(frame, camera.frame, None, None)
+            overlay.draw(frame, camera.frame,
+                         camera.depth_frame if depth_mode else None,
+                         camera if depth_mode else None)
             cv2.imshow(window, frame)
             key = cv2.waitKey(1) & 0xff
             if key in (ord("q"), 27):
@@ -579,7 +701,7 @@ def run_preview(camera, config_path=CONFIG_PATH):
             if key == ord("v"):
                 overlay.enabled = not overlay.enabled
             if key == ord("m"):
-                run_setup(camera, config_path)
+                run_setup(camera, config_path, depth_mode)
                 overlay.shape = None  # Reload the saved clicks on the next frame.
     finally:
         cv2.destroyWindow(window)

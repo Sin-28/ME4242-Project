@@ -35,8 +35,9 @@ from nus_control import (MAX_TRAVEL_RAD, PULL_MAX_MM, PULLEY_RADIUS_MM, Cables, 
                          probe_model, raise_tip, reachability, reset_live_model, set_live_model, solve_pulls)
 from nus_path import densify, footprint, min_clearance, path_length, plan_path, touched
 from nus_vision import LETTERS, Vision, draw_overlay, fmt, load_config, save_config_value
-from nus_bending import (BendingOverlay, RGBCamera,
+from nus_bending import (BendingOverlay, CONFIG_PATH, DEPTH_CONFIG_PATH, RGBCamera,
                          run_preview as run_bending_preview, run_setup as run_bending_setup)
+from nus_depth_camera import AlignedDepthCamera
 
 WINDOW = "NUS retrieval  (q / Esc = stop)"
 
@@ -92,7 +93,7 @@ class Display:
             cv2.line(image, tuple(int(v) for v in tip["px"]), tuple(int(v) for v in self.target_px),
                      (255, 0, 255), 1, cv2.LINE_AA)
         if self.bending.enabled:
-            self.bending.draw(image, frame, None, None)
+            self.bending.draw(image, frame, self.vision.camera.depth_frame, self.vision)
         if self.recorder is not None:
             self.recorder.write(image)
         cv2.imshow(WINDOW, image)
@@ -759,11 +760,11 @@ def cmd_goto(cfg, args):
 
 def cmd_bending_setup(_cfg, args):
     try:
-        camera = RGBCamera(args.camera)
+        camera = AlignedDepthCamera() if args.depth else RGBCamera(args.camera)
     except RuntimeError as exc:
         sys.exit(str(exc))
     try:
-        run_bending_setup(camera)
+        run_bending_setup(camera, DEPTH_CONFIG_PATH if args.depth else CONFIG_PATH, args.depth)
     except RuntimeError as exc:
         sys.exit(str(exc))
     finally:
@@ -773,11 +774,11 @@ def cmd_bending_setup(_cfg, args):
 
 def cmd_bending_preview(_cfg, args):
     try:
-        camera = RGBCamera(args.camera)
+        camera = AlignedDepthCamera() if args.depth else RGBCamera(args.camera)
     except RuntimeError as exc:
         sys.exit(str(exc))
     try:
-        run_bending_preview(camera)
+        run_bending_preview(camera, DEPTH_CONFIG_PATH if args.depth else CONFIG_PATH, args.depth)
     except RuntimeError as exc:
         sys.exit(str(exc))
     finally:
@@ -792,10 +793,18 @@ def main():
     p_chk.add_argument("--apply", action="store_true", help="save the measured stage height to nus_config.json")
     p_chk.add_argument("--letter-mm", type=float, default=5.0, help="letter thickness in mm (default 5)")
     sub.add_parser("detect", help="camera only: show detections, teach letter shapes")
-    p_setup = sub.add_parser("bending-setup", help="save rod ROI, base and marker positions using RGB")
+    p_setup = sub.add_parser("bending-setup", help="save rod markers and aligned depth (RGB-only optional)")
     p_setup.add_argument("--camera", type=int, default=0, help="OpenCV RGB camera index (default 0)")
-    p_preview = sub.add_parser("bending-preview", help="preview 2D bending using RGB without motors")
+    p_setup.add_argument("--depth", dest="depth", action="store_true", default=True,
+                         help="Use aligned D405 color/depth (default)")
+    p_setup.add_argument("--rgb-only", dest="depth", action="store_false",
+                         help="Use color camera without depth validation")
+    p_preview = sub.add_parser("bending-preview", help="preview depth-validated bending without motors")
     p_preview.add_argument("--camera", type=int, default=0, help="OpenCV RGB camera index (default 0)")
+    p_preview.add_argument("--depth", dest="depth", action="store_true", default=True,
+                           help="Use aligned D405 depth to reject background markers (default)")
+    p_preview.add_argument("--rgb-only", dest="depth", action="store_false",
+                           help="Use color-only tracking without depth validation")
     sub.add_parser("jog", help="wind cables by keyboard: take up slack, find pull directions")
     p_cal = sub.add_parser("calibrate", help="find cable directions/taut points and measure the model")
     p_cal.add_argument("--first-direction", type=int, choices=(-1, 1), default=-1,
@@ -839,7 +848,7 @@ def main():
     for command, subparser in sub.choices.items():
         if command not in ("bending-setup", "bending-preview"):
             subparser.add_argument("--bending", action="store_true",
-                                   help="show live 2D rod bending angles (v toggles during the run)")
+                                   help="show live 2D/3D rod bending angles (v toggles during the run)")
     args = parser.parse_args()
     if args.command == "calibrate" and not 1 <= args.search_mm <= 100:
         parser.error("--search-mm must be between 1 and 100")

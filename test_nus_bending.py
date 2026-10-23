@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from nus_bending import (BendingOverlay, add_manual_marker, bend_sections, follow_markers, load_settings, marker_chain,
-                         save_settings, split_two_bends, turning_angles)
+                         save_settings, spatial_angles, spatial_points, split_two_bends, turning_angles)
 
 
 class BendingTests(unittest.TestCase):
@@ -52,22 +52,28 @@ class BendingTests(unittest.TestCase):
             self.assertEqual(load_settings((500, 1100, 3), path), settings)
             self.assertIsNone(load_settings((480, 640, 3), path))
 
-    def test_two_bends_in_2d(self):
+    def test_two_bends_and_depth_from_existing_frames(self):
         frame, settings = self.frame_and_settings()
         chain, status = marker_chain(frame, settings)
-        self.assertEqual(len(chain), 10, status)
+        self.assertEqual(len(chain), 10)
         ordered = [settings["base"]] + chain[::-1]
         bend = split_two_bends(turning_angles(ordered))
         self.assertIsNotNone(bend)
         self.assertLess(bend[1], -15)
         self.assertGreater(bend[2], 15)
-
-    def test_three_2d_bends(self):
-        headings = np.radians([0, 0, 15, 30, 15, 0, 0, 15, 30, 30])
-        xy = [(0., 0.)]
-        for angle in headings:
-            xy.append(tuple(np.asarray(xy[-1]) + 25*np.array([np.cos(angle), np.sin(angle)])))
-        self.assertEqual(len(bend_sections(xy)), 3)
+        depth = np.full(frame.shape[:2], 1000, np.uint16)
+        for point in ordered[len(ordered)//2:]:
+            cv2.circle(depth, tuple(map(int, point)), 16, 1200, -1)
+        values, message = spatial_angles(ordered, bend, depth,
+                                         lambda x, y, z: ((x-550)*z/500, (y-250)*z/500, z))
+        self.assertEqual(len(values), 2)
+        self.assertTrue(all(np.isfinite(values)))
+        self.assertIn("3D base", message)
+        depth[:] = 0
+        values, message = spatial_angles(ordered, bend, depth,
+                                         lambda x, y, z: ((x-550)*z/500, (y-250)*z/500, z))
+        self.assertIsNone(values)
+        self.assertIn("showing 2D", message)
 
     def test_live_overlay_draws_tip_line_and_local_angles(self):
         frame, settings = self.frame_and_settings()
@@ -145,6 +151,45 @@ class BendingTests(unittest.TestCase):
             self.assertEqual(status, "10/10")
             self.assertLess(np.max(np.linalg.norm(updated-reference, axis=1)), 3)
 
+    def test_depth_tracking_requires_saved_depth_and_aligned_frame(self):
+        frame, settings = self.frame_and_settings()
+        reference, _ = marker_chain(frame, settings)
+        settings["reference_points"] = reference
+        overlay = BendingOverlay(True, depth_tracking=True)
+        with patch("nus_bending.load_settings", return_value=settings), \
+             patch("nus_bending.follow_markers", side_effect=AssertionError("must require depth setup")):
+            overlay.draw(frame.copy(), frame, np.full(frame.shape[:2], 1000, np.float32), None)
+        settings["reference_depth_mm"] = [1000.0]*10
+        overlay.shape = None
+        with patch("nus_bending.load_settings", return_value=settings), \
+             patch("nus_bending.follow_markers", side_effect=AssertionError("must require aligned depth")):
+            overlay.draw(frame.copy(), frame, np.zeros((240, 650), np.float32), None)
+
+    def test_depth_rejects_same_color_background_inside_tracking_window(self):
+        frame = np.full((240, 650, 3), 110, np.uint8)
+        depth = np.full((240, 650), 1250, np.float32)
+        previous = [(50, 120)] + [(x, 120) for x in (100, 155, 210, 265, 320, 375, 430, 485, 540)]
+        blue, green = (200, 150, 60), (90, 230, 90)
+        for index, point in enumerate(previous):
+            color = green if index == 0 else blue
+            cv2.circle(frame, point, 7, color, -1)
+            cv2.circle(depth, point, 7, 1000, -1)
+        # A false blue disc lies exactly at B4's old center. The true B4 moved
+        # within the local search window but remains at the rod depth.
+        old = previous[4]
+        cv2.circle(depth, old, 7, 1250, -1)
+        cv2.circle(frame, (old[0], old[1]+17), 7, blue, -1)
+        cv2.circle(depth, (old[0], old[1]+17), 7, 1000, -1)
+        hsv = lambda color: [int(v) for v in cv2.cvtColor(np.uint8([[color]]), cv2.COLOR_BGR2HSV)[0, 0]]
+        settings = {"roi": [25, 80, 550, 90], "blue_hsv": hsv(blue),
+                    "green_hsv": hsv(green)}
+        found = follow_markers(frame, settings, previous, 0, depth, [1000]*10)
+        self.assertIsNotNone(found[4])
+        self.assertGreater(found[4][1], old[1]+12)
+        depth[:] = 0
+        self.assertTrue(all(point is None for point in
+                            follow_markers(frame, settings, previous, 0, depth, [1000]*10)))
+
     def test_background_discs_cannot_steal_stationary_markers(self):
         frame = np.full((360, 680, 3), 110, np.uint8)
         previous = [(50+i*55, 150) for i in range(10)]
@@ -179,6 +224,23 @@ class BendingTests(unittest.TestCase):
         points, status = overlay._recover(frame)
         self.assertEqual(len(points), 10, status)
         self.assertIsNotNone(overlay.last_points)
+
+    def test_three_bends_and_out_of_plane_depth(self):
+        headings = np.radians([0, 0, 15, 30, 15, 0, 0, 15, 30, 30])
+        xy = [(0., 0.)]
+        for angle in headings:
+            xy.append(tuple(np.asarray(xy[-1]) + 25*np.array([np.cos(angle), np.sin(angle)])))
+        self.assertEqual(len(bend_sections(xy)), 3)
+        xyz = [(float(i*25), 0., float(1200 + 90*np.sin(i*np.pi/5))) for i in range(11)]
+        self.assertGreaterEqual(len(bend_sections(xyz, min_bend=8)), 1)
+        depth = np.full((100, 350), 1200, np.uint16)
+        points = [(i*25+20, 50) for i in range(11)]
+        for i, point in enumerate(points):
+            cv2.circle(depth, point, 8, int(xyz[i][2]), -1)
+        recovered, message = spatial_points(points, depth,
+                                            lambda x, y, z: (x-20, y-50, z))
+        self.assertIn("3D", message)
+        self.assertGreaterEqual(len(bend_sections(recovered, min_bend=8)), 1)
 
 
 if __name__ == "__main__":
