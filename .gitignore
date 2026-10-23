@@ -6,3 +6,4 @@ runs/
 test_output/
 snapshot_*.png
 bending_config.json
+.build/

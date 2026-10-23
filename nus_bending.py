@@ -1,7 +1,6 @@
-"""Optional, read-only bending overlay for the existing EMIO color/depth frames."""
+"""Optional, read-only 2D bending overlay for color camera frames."""
 
 import json
-import math
 from pathlib import Path
 
 import cv2
@@ -41,7 +40,8 @@ def load_settings(shape, path=CONFIG_PATH):
         return None
 
 
-def save_settings(shape, roi, base, blue_hsv, green_hsv, path=CONFIG_PATH, reference_points=None):
+def save_settings(shape, roi, base, blue_hsv, green_hsv, path=CONFIG_PATH,
+                  reference_points=None):
     height, width = shape[:2]
     data = {"frame_size": [width, height], "roi": list(roi), "base": list(base),
             "blue_hsv": list(blue_hsv), "green_hsv": list(green_hsv)}
@@ -157,7 +157,8 @@ def follow_markers(frame, settings, previous, hue_offset):
         x0, x1 = max(0, x-radius_x), min(width, x+radius_x+1)
         y0, y1 = max(0, y-radius_y), min(height, y+radius_y+1)
         mask = green_mask if index == 0 else blue_mask
-        ys, xs = np.nonzero(mask[y0:y1, x0:x1])
+        local = mask[y0:y1, x0:x1]
+        ys, xs = np.nonzero(local)
         if len(xs) < (18 if index == 0 else 45):
             found.append(None)
         else:
@@ -193,7 +194,7 @@ def bend_sections(points, min_bend=15.0):
     """Return independent bends as (first marker, last marker, angle).
 
     Adjacent turns in the same direction belong to one bend. A reversal starts
-    another section; small color/depth jitter is ignored.
+    another section; small color jitter is ignored.
     """
     vectors = np.diff(np.asarray(points, float), axis=0)
     lengths = np.linalg.norm(vectors, axis=1)
@@ -231,70 +232,10 @@ def bend_sections(points, min_bend=15.0):
     return sections
 
 
-def spatial_points(points, depth, pixel_to_robot):
-    if depth is None or depth.ndim != 2 or pixel_to_robot is None:
-        return None, "depth unavailable"
-    xyz = []
-    for x, y in points:
-        value = depth_at(depth, (x, y))
-        xyz.append(None if value is None else np.asarray(pixel_to_robot(x, y, value), float))
-    valid = sum(point is not None and np.all(np.isfinite(point)) for point in xyz)
-    if valid != len(points):
-        return None, f"depth {valid}/{len(points)}; showing 2D"
-    return np.asarray(xyz), "3D depth ready"
-
-
-def depth_at(depth, point):
-    x, y = (int(round(v)) for v in point)
-    height, width = depth.shape
-    for radius in (4, 8, 14):
-        x0, x1 = max(0, x-radius), min(width, x+radius+1)
-        y0, y1 = max(0, y-radius), min(height, y+radius+1)
-        if x0 >= x1 or y0 >= y1:
-            return None
-        yy, xx = np.ogrid[y0:y1, x0:x1]
-        values = depth[y0:y1, x0:x1][(xx-x)**2+(yy-y)**2 <= radius**2]
-        values = values[(values > 0) & (values < 2000)]  # emioapi supplies millimeters
-        if len(values) >= 5:
-            return float(np.median(values))
-    return None
-
-
-def angle_between(a, b):
-    return math.degrees(math.acos(np.clip(float(np.dot(a, b) /
-                                               (np.linalg.norm(a)*np.linalg.norm(b))), -1, 1)))
-
-
-def spatial_angles(points, bend, depth, pixel_to_robot):
-    if depth is None or depth.ndim != 2:
-        return None, "depth unavailable"
-    xyz = []
-    for x, y in points:
-        value = depth_at(depth, (x, y))
-        xyz.append(None if value is None else np.asarray(pixel_to_robot(x, y, value), float))
-    valid = sum(point is not None and np.all(np.isfinite(point)) for point in xyz)
-    if valid != len(points):
-        return None, f"depth {valid}/{len(points)}; showing 2D"
-    xyz = np.asarray(xyz)
-    def section(start, end):
-        if end-start < 2:
-            return None
-        first, last = xyz[start+2]-xyz[start], xyz[end]-xyz[end-2]
-        if min(np.linalg.norm(first), np.linalg.norm(last)) < 1e-5:
-            return None
-        return angle_between(first, last)
-    if bend is None:
-        value = section(0, len(points)-1)
-        return (value,), f"3D {value:.1f} deg" if value is not None else "depth geometry invalid"
-    cut = bend[0]
-    values = (section(0, cut+1), section(cut, len(points)-1))
-    return values, (f"3D base {values[0]:.1f} | tip {values[1]:.1f} deg"
-                    if None not in values else "depth geometry invalid")
-
-
 class BendingOverlay:
-    def __init__(self, enabled=False):
+    def __init__(self, enabled=False, config_path=CONFIG_PATH):
         self.enabled = enabled
+        self.config_path = config_path
         self.settings = None
         self.shape = None
         self.last_points = None
@@ -388,12 +329,12 @@ class BendingOverlay:
         return updated.copy(), ("10/10" if visible == 10 else
                                 f"{visible}/10 visible; {10-visible} held")
 
-    def draw(self, image, frame, depth, vision):
+    def draw(self, image, frame, _depth=None, _vision=None):
         if not self.enabled:
             return image
         if self.shape != image.shape[:2]:
             self.shape = image.shape[:2]
-            self.settings = load_settings(image.shape)
+            self.settings = load_settings(image.shape, self.config_path)
             self.last_points = self.missed = None
             self.hue_offset = 0
             if self.settings is not None and self.settings.get("reference_points") is not None:
@@ -413,27 +354,24 @@ class BendingOverlay:
             points, status = self._recover(frame)
             detection_status = status
         if points is None:
+            reference = self.settings.get("reference_points", [])
+            draw_reference_markers(image, reference)
             self._text(image, "Bending: " + status + " (" + detection_status + ")", 0)
+            self._text(image, "Reference markers shown; press m in RGB preview to edit", 1)
             return image
         base = tuple(self.settings["base"])
         if base[0] <= points[-1][0]:
             self._text(image, "Bending: base must be right of markers", 0)
             return image
-        ordered = [base] + points[::-1]
+        ordered = [base] + [tuple(point) for point in points[::-1]]
         try:
             turns = turning_angles(ordered)
         except ValueError as exc:
             self._text(image, "Bending: " + str(exc), 0)
             return image
-        sections_2d = bend_sections(ordered)
+        sections_2d = bend_sections(ordered, min_bend=5.0)
         two_d = ("2D " + (" | ".join(f"B{i} {angle:+.1f} deg" for i, (_, _, angle)
                                     in enumerate(sections_2d, 1)) if sections_2d else "straight"))
-        converter = vision.pixel_to_robot if vision is not None else None
-        xyz, depth_status = spatial_points(ordered, depth, converter)
-        if xyz is not None:
-            sections_3d = bend_sections(xyz)
-            depth_status = ("3D " + (" | ".join(f"B{i} {angle:.1f} deg" for i, (_, _, angle)
-                                             in enumerate(sections_3d, 1)) if sections_3d else "straight"))
         cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 0, 0), 6)
         cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 255, 255), 3)
         cv2.circle(image, tuple(map(int, base)), 12, (0, 0, 255), 3)
@@ -442,11 +380,22 @@ class BendingOverlay:
             color = (0, 255, 0) if index == MARKER_COUNT else (255, 100, 0)
             cv2.circle(image, center, 13, (0, 0, 0), 6)
             cv2.circle(image, center, 13, color, 4)
-            cv2.putText(image, "T" if index == MARKER_COUNT else str(index),
+            cv2.putText(image, "T" if index == MARKER_COUNT else f"B{MARKER_COUNT-index}",
                         (center[0]+11, center[1]-10), cv2.FONT_HERSHEY_SIMPLEX, .45,
                         color, 2)
+        for start, end, angle in sections_2d:
+            if abs(angle) <= 5.0:
+                continue
+            center_index = (start + end) // 2
+            x, y = np.rint(ordered[center_index]).astype(int)
+            label = f"{angle:+.1f} deg"
+            x = int(np.clip(x + 14, 4, max(4, image.shape[1]-125)))
+            y = int(np.clip(y - 22, 25, max(25, image.shape[0]-65)))
+            cv2.putText(image, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        .68, (0, 0, 0), 5)
+            cv2.putText(image, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        .68, (0, 255, 255), 2)
         self._text(image, f"Bending: {status} | {two_d}", 0)
-        self._text(image, depth_status, 1)
         return image
 
     @staticmethod
@@ -466,34 +415,63 @@ def sample_color(frame, point):
     return tuple(int(v) for v in np.median(pixels, axis=0))
 
 
-def run_setup(camera):
-    """One-time interactive calibration using the project's existing camera."""
-    window = "Bending setup (r ROI, a base, b blue, g green, q quit)"
+def add_manual_marker(points, kind, point, roi):
+    """Build a tip-to-base reference chain from explicit user clicks."""
+    x, y = point
+    if roi is None or not (roi[0] <= x < roi[0]+roi[2] and roi[1] <= y < roi[1]+roi[3]):
+        raise ValueError("Click inside the ROI")
+    if kind == "g":
+        return [(float(x), float(y))]
+    if not points:
+        raise ValueError("Click green tip first (g)")
+    if len(points) >= MARKER_COUNT:
+        raise ValueError("All 9 blue markers are set; u undo or g restart")
+    if x <= points[-1][0]:
+        raise ValueError("Click blue markers from tip toward base (left to right)")
+    return points + [(float(x), float(y))]
+
+
+def draw_reference_markers(image, points, prefix=""):
+    """Show the exact saved/clicked centers even if color tracking fails."""
+    for index, point in enumerate(points):
+        center = tuple(map(lambda v: int(round(v)), point))
+        color = (0, 255, 0) if index == 0 else (255, 100, 0)
+        label = "T" if index == 0 else f"B{index}"
+        cv2.circle(image, center, 13, (0, 0, 0), 5)
+        cv2.circle(image, center, 13, color, 2)
+        cv2.putText(image, prefix + label, (center[0]+12, center[1]-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 0), 3)
+        cv2.putText(image, prefix + label, (center[0]+12, center[1]-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, .55, color, 2)
+
+
+def run_setup(camera, config_path=CONFIG_PATH):
+    """Interactive ROI, base, and one-by-one marker calibration."""
+    window = "Bending setup (r ROI, a base, g tip, b blue x9, u undo, s save, q quit)"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     existing = None
     roi = base = None
     blue_hsv, green_hsv = BLUE_HSV, GREEN_HSV
+    manual_points = []
     mode = None
     frame = None
-    note = "r: ROI around all marker movement; a: fixed base; b/g: sample colors"
+    note = "r ROI; a base; g green tip; b blue markers from tip to base"
 
     def persist():
         nonlocal note
-        if roi is not None and base is not None:
-            try:
-                current = {"roi": roi, "blue_hsv": blue_hsv, "green_hsv": green_hsv}
-                reference, _ = marker_chain(frame, current)
-                if len(reference) != MARKER_COUNT and existing is not None:
-                    reference = existing.get("reference_points", [])
-                save_settings(frame.shape, roi, base, blue_hsv, green_hsv,
-                              reference_points=reference if len(reference) == MARKER_COUNT else None)
-                note = ("Saved 10 marker positions; q to quit" if len(reference) == MARKER_COUNT
-                        else "Saved colors/ROI; show all 10 markers and press s to save positions")
-            except OSError as exc:
-                note = f"Could not save calibration: {exc}"
+        if roi is None or base is None:
+            note = "Select ROI (r) and base (a) before saving"
+            return
+        try:
+            save_settings(frame.shape, roi, base, blue_hsv, green_hsv, config_path,
+                          reference_points=manual_points if len(manual_points) == MARKER_COUNT else None)
+            note = ("Saved T + B1-B9 reference points" if len(manual_points) == MARKER_COUNT
+                    else f"Saved ROI/base/colors; click {MARKER_COUNT-len(manual_points)} more markers")
+        except OSError as exc:
+            note = f"Could not save calibration: {exc}"
 
     def mouse(event, x, y, _flags, _param):
-        nonlocal mode, base, blue_hsv, green_hsv, note
+        nonlocal mode, base, blue_hsv, green_hsv, manual_points, note
         if event != cv2.EVENT_LBUTTONDOWN or frame is None or mode is None:
             return
         if mode == "a":
@@ -501,13 +479,24 @@ def run_setup(camera):
             persist()
         elif mode in ("b", "g"):
             try:
-                value = sample_color(frame, (x, y))
-                if mode == "b": blue_hsv = value
-                else: green_hsv = value
+                updated = add_manual_marker(manual_points, mode, (x, y), roi)
+                try:
+                    value = sample_color(frame, (x, y))
+                except ValueError:
+                    value = None  # Keep the clicked position even in washed-out light.
+                manual_points = updated
+                if mode == "g" and value is not None: green_hsv = value
+                elif len(manual_points) == 2 and value is not None: blue_hsv = value
                 persist()
+                if mode == "g":
+                    note = "T set; press b and click blue markers from tip to base"
+                elif len(manual_points) < MARKER_COUNT:
+                    note = f"B{len(manual_points)-1} set; click B{len(manual_points)}"
             except ValueError as exc:
                 note = str(exc)
-        mode = None
+                return
+        if mode != "b" or len(manual_points) == MARKER_COUNT:
+            mode = None
 
     cv2.setMouseCallback(window, mouse)
     try:
@@ -515,27 +504,40 @@ def run_setup(camera):
             camera.update()
             frame = camera.frame.copy()
             if existing is None:
-                existing = load_settings(frame.shape)
+                existing = load_settings(frame.shape, config_path)
                 if existing:
                     roi, base = tuple(existing["roi"]), tuple(existing["base"])
                     blue_hsv, green_hsv = tuple(existing["blue_hsv"]), tuple(existing["green_hsv"])
-                    note = "Saved calibration loaded; choose r/a/b/g to change it"
+                    manual_points = [tuple(point) for point in existing.get("reference_points", [])]
+                    note = "Saved calibration loaded; g restarts markers, b adds blue, u undoes"
             view = frame.copy()
             if roi: cv2.rectangle(view, roi[:2], (roi[0]+roi[2], roi[1]+roi[3]), (0, 255, 255), 2)
             if base: cv2.drawMarker(view, base, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+            draw_reference_markers(view, manual_points)
             BendingOverlay._text(view, note, 0)
+            BendingOverlay._text(view, f"Manual markers {len(manual_points)}/10 | r ROI  a base  g tip  b blue  u undo  s save  q quit", 1)
             cv2.imshow(window, view)
             key = cv2.waitKey(1) & 0xff
             if key in (ord("q"), 27): break
             if key in (ord("a"), ord("b"), ord("g")):
                 mode = chr(key)
-                note = f"Click {'base' if mode == 'a' else 'blue marker' if mode == 'b' else 'green tip'}"
+                note = ("Click base" if mode == "a" else
+                        "Click green tip to start a new chain" if mode == "g" else
+                        f"Click B{len(manual_points)} from tip toward base")
+            if key == ord("u"):
+                if manual_points:
+                    manual_points.pop()
+                    note = f"Undid marker; {len(manual_points)}/10 remain"
+                    persist()
+                mode = None
             if key == ord("s"):
                 persist()
             if key == ord("r"):
                 selected = cv2.selectROI(window, frame, False, False)
                 if selected[2] and selected[3]:
                     roi = tuple(int(v) for v in selected)
+                    manual_points = []
+                    note = "ROI changed; click g tip, then b for nine blue markers"
                     persist()
                 cv2.setMouseCallback(window, mouse)
     finally:
@@ -543,7 +545,7 @@ def run_setup(camera):
 
 
 class RGBCamera:
-    """OpenCV color-only camera for setup/preview when the depth SDK is unavailable."""
+    """OpenCV color camera for 2D setup and preview."""
     def __init__(self, index=0):
         self.capture = cv2.VideoCapture(index)
         if not self.capture.isOpened():
@@ -559,11 +561,12 @@ class RGBCamera:
         self.capture.release()
 
 
-def run_preview(camera):
-    """Test marker tracking without the depth SDK or motor controller."""
-    window = "Bending RGB preview (v toggle, q quit)"
+def run_preview(camera, config_path=CONFIG_PATH):
+    """Preview marker tracking without motor control."""
+    window = "Bending RGB preview (m setup, v toggle, q quit)"
+    print(f"Opening preview window: {window}", flush=True)
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    overlay = BendingOverlay(enabled=True)
+    overlay = BendingOverlay(enabled=True, config_path=config_path)
     try:
         while True:
             camera.update()
@@ -575,5 +578,8 @@ def run_preview(camera):
                 break
             if key == ord("v"):
                 overlay.enabled = not overlay.enabled
+            if key == ord("m"):
+                run_setup(camera, config_path)
+                overlay.shape = None  # Reload the saved clicks on the next frame.
     finally:
         cv2.destroyWindow(window)

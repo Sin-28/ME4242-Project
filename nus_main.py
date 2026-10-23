@@ -35,7 +35,8 @@ from nus_control import (MAX_TRAVEL_RAD, PULL_MAX_MM, PULLEY_RADIUS_MM, Cables, 
                          probe_model, raise_tip, reachability, reset_live_model, set_live_model, solve_pulls)
 from nus_path import densify, footprint, min_clearance, path_length, plan_path, touched
 from nus_vision import LETTERS, Vision, draw_overlay, fmt, load_config, save_config_value
-from nus_bending import BendingOverlay, RGBCamera, run_preview as run_bending_preview, run_setup as run_bending_setup
+from nus_bending import (BendingOverlay, RGBCamera,
+                         run_preview as run_bending_preview, run_setup as run_bending_setup)
 
 WINDOW = "NUS retrieval  (q / Esc = stop)"
 
@@ -91,7 +92,7 @@ class Display:
             cv2.line(image, tuple(int(v) for v in tip["px"]), tuple(int(v) for v in self.target_px),
                      (255, 0, 255), 1, cv2.LINE_AA)
         if self.bending.enabled:
-            self.bending.draw(image, frame, self.vision.camera.depth_frame, self.vision)
+            self.bending.draw(image, frame, None, None)
         if self.recorder is not None:
             self.recorder.write(image)
         cv2.imshow(WINDOW, image)
@@ -763,6 +764,8 @@ def cmd_bending_setup(_cfg, args):
         sys.exit(str(exc))
     try:
         run_bending_setup(camera)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
     finally:
         camera.close()
         cv2.destroyAllWindows()
@@ -775,6 +778,8 @@ def cmd_bending_preview(_cfg, args):
         sys.exit(str(exc))
     try:
         run_bending_preview(camera)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
     finally:
         camera.close()
         cv2.destroyAllWindows()
@@ -787,9 +792,9 @@ def main():
     p_chk.add_argument("--apply", action="store_true", help="save the measured stage height to nus_config.json")
     p_chk.add_argument("--letter-mm", type=float, default=5.0, help="letter thickness in mm (default 5)")
     sub.add_parser("detect", help="camera only: show detections, teach letter shapes")
-    p_setup = sub.add_parser("bending-setup", help="RGB camera only: save the rod ROI, base and marker colors")
+    p_setup = sub.add_parser("bending-setup", help="save rod ROI, base and marker positions using RGB")
     p_setup.add_argument("--camera", type=int, default=0, help="OpenCV RGB camera index (default 0)")
-    p_preview = sub.add_parser("bending-preview", help="RGB camera only: preview bending without depth or motors")
+    p_preview = sub.add_parser("bending-preview", help="preview 2D bending using RGB without motors")
     p_preview.add_argument("--camera", type=int, default=0, help="OpenCV RGB camera index (default 0)")
     sub.add_parser("jog", help="wind cables by keyboard: take up slack, find pull directions")
     p_cal = sub.add_parser("calibrate", help="find cable directions/taut points and measure the model")
@@ -834,7 +839,7 @@ def main():
     for command, subparser in sub.choices.items():
         if command not in ("bending-setup", "bending-preview"):
             subparser.add_argument("--bending", action="store_true",
-                                   help="show live 2D/3D rod bending angles (v toggles during the run)")
+                                   help="show live 2D rod bending angles (v toggles during the run)")
     args = parser.parse_args()
     if args.command == "calibrate" and not 1 <= args.search_mm <= 100:
         parser.error("--search-mm must be between 1 and 100")

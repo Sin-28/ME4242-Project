@@ -1,66 +1,54 @@
-# Optional rod bending display
+# Optional 2D rod bending display
 
-This is a read-only overlay on the color and depth frames already acquired by
-`nus_main.py`. It never changes motor commands, calibration, or route planning.
-It is **off by default**.
+The bending overlay uses the RGB camera to track the green tip and nine blue
+markers. It draws the numbered markers, a yellow connection line to the fixed
+base, and labels bends greater than 5° beside the rod. It is read-only and off
+by default during the existing N-U-S commands. This branch does not use depth
+for bending tracking or 3D bend angles. Similar-colored objects can still
+confuse RGB tracking.
 
-## One-time setup
-
-With the camera connected, run:
+## Calibrate the markers
 
 ```bash
 python nus_main.py bending-setup
 ```
 
-This setup uses the D405 RGB feed through OpenCV and does not start the depth
-SDK or motors. If the D405 is not camera index 0, add `--camera N`.
+Add `--camera N` if the RGB camera is not index 0. In the setup window:
 
-In the camera window, press `r` and draw an ROI that includes the green tip and
-all nine blue discs **throughout their expected movement**. The fixed base mount
-can stay outside the ROI. Press `a`, then click the point where the rod leaves
-the mount. If the default colors do not detect the discs, press `b` and click
-the center of one blue disc; press `g` and click the green tip. Press `q` to
-finish. With all ten discs visible, press `s` to save their reference positions.
-The settings are saved in ignored `bending_config.json` and reused when
-the frame size matches. Run setup again if the camera or mount moves.
+1. Press `r` and draw an ROI covering all expected marker movement. Include
+   the green tip and all blue markers; keep similar-colored background objects
+   outside it where possible.
+2. Press `a` and click the fixed base.
+3. Press `g` and click the green tip center.
+4. Press `b` once and click blue markers B1 through B9 from tip toward base.
+   Each click displays a numbered ring. Press `u` to undo a marker or `g` to
+   restart the sequence.
+5. Press `s` to save and `q` to close.
 
-## Turn it on and off
+The setup saves `bending_config.json` locally. It reloads the settings when the
+RGB frame size matches. A new ROI clears the saved marker sequence.
 
-Check the RGB tracking without motors or the depth SDK:
+## Preview
 
 ```bash
 python nus_main.py bending-preview
 ```
 
-The RGB preview shows 2D angles only. The regular N-U-S commands use
-`Vision.open_camera()` from `emioapi` for depth. On the test Mac, the D405
-appeared on USB and RGB preview worked, but the RealSense SDK crashed during
-device enumeration. The integrated 3D overlay needs a successful depth-camera
-startup before it can be validated live.
+Press `m` to reopen setup, `v` to toggle the overlay, and `q` or Esc to quit.
+The preview does not start the motors. If tracking loses the chain, the saved
+reference rings remain visible so that the expected and observed locations can
+be compared. Marker identities follow the manually clicked order. The tip and
+connection line update with tracked positions, and signed 2D bends over 5°
+are labeled on the image.
 
-Append `--bending` to any existing command, for example:
+The overlay can also be enabled for existing commands, for example:
 
 ```bash
 python nus_main.py detect --bending
 python nus_main.py search --bending --record
 ```
 
-During any camera session, press `v` to toggle the overlay. Without
-`--bending`, it starts off. The existing `q` / Esc stop keys still work.
-
-The overlay draws a numbered blue ring around each intermediate marker, a green
-ring around the tip, a red base ring, and a yellow connecting line. It shows
-each detected bend separately (`B1`, `B2`, etc.). Signed 2D angles use `+` for
-clockwise motion on screen. With valid depth at every marker, it also estimates
-unsigned 3D bend angles, including motion toward or away from the camera.
-Missing depth leaves the 2D measurement and a depth status visible. Angles are
-shown only when the full ten-marker chain is tracked; briefly held positions
-can appear during occlusion. After tracking loss, the overlay retries the saved
-reference pose and original marker colors automatically.
-
-The marker ordering assumes the base is to the right of the tip in the image
-and the rod does not fold backward in image x. 3D values use the existing
-`emioapi` camera calibration and its millimeter depth frame. The current SDK
-returns depth and color frames without explicit pixel alignment, so the 3D
-values are provisional until alignment and physical accuracy are verified.
-The repository tests use synthetic color and depth frames.
+The existing N-U-S vision and motor functions have their own camera requirements.
+The bending overlay in this branch uses their RGB frame only. Marker ordering
+assumes the fixed base is to the right of the tip and the rod does not fold
+backward in image x.
