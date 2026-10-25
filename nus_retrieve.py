@@ -34,7 +34,7 @@ import numpy as np
 from nus_control import (Cables, Watchdog, align_to_calibration, describe_model, load_calibration, lower_onto,
                          move_tip_adaptive, move_tip_along, probe_model, reachability, reset_live_model,
                          set_live_model)
-from nus_path import approach_routes, densify, footprint, support_of
+from nus_path import approach_routes, densify, path_length, plan_path, support_of
 from nus_ui import WINDOW, Display, Recorder, open_camera_or_exit, stable_objects
 from nus_vision import LETTERS, Vision, fmt, save_config_value
 
@@ -100,9 +100,21 @@ def plan(ctx, start_xz, goal_xyz, letters, objects, skip=(), failed=(), carrying
                for L, f in letters.items() if L not in skip]
     if support is not None:
         support = dict(support, inflate=cfg["tip_length_mm"] + 2.0)
-    return approach_routes(start_xz, goal, others, support=support, axis=ctx["middle"],
-                           clearance_mm=args.clearance_mm, standoff_mm=cfg["tip_length_mm"] + 6.0,
-                           directions=args.directions, reachable=ctx["reachable"], failed_angles=failed), support
+    routes = approach_routes(start_xz, goal, others, support=support, axis=ctx["middle"],
+                             clearance_mm=args.clearance_mm, standoff_mm=cfg["tip_length_mm"] + 6.0,
+                             directions=args.directions, reachable=ctx["reachable"], failed_angles=failed)
+    if not routes:
+        # no side works: as a last resort, the plain shortest way to the magnet (straight onto the
+        # block, like `search`), tried once (its side is then marked failed like any other)
+        start = np.asarray(start_xz, float)
+        path = plan_path(start, goal, others, args.clearance_mm, ctx["reachable"]) or [start, goal]
+        before = np.asarray(path[-2], float)
+        angle = float(np.degrees(np.arctan2(*(before - goal)[::-1]))) % 360.0
+        if not any(abs((angle - a + 180.0) % 360.0 - 180.0) < 30.0 for a in failed):
+            length = path_length(path)
+            routes = [{"path": list(path), "approach": before, "angle_deg": angle, "cost": length + 1000.0,
+                       "length": length, "direct": True}]
+    return routes, support
 
 
 def show_plans(display, plans, chosen=None, marks=()):
@@ -123,11 +135,17 @@ def show_plans(display, plans, chosen=None, marks=()):
 def back_to_middle(ctx, settle_s=1.2):
     """Release the cables: the arm goes back to its middle (rest) pose. Model back to the calibration's."""
     ctx["cables"].set_pulls(np.zeros(4))
+    ctx["vision"].forget_tip(expect=ctx["rest"])     # it springs back toward the middle: look there
     end = time.time() + settle_s
     while time.time() < end:
         frame, depth = ctx["vision"].grab()
         ctx["display"].show(frame, ctx["vision"].find_tip(frame, depth))
     reset_live_model(ctx["cables"])
+    tip = ctx["vision"].measure_tip(5, ctx["display"].show)
+    if tip is None:
+        print("    WARNING: can't see the tip after letting go of the cables (hidden, or caught?)")
+    elif np.hypot(*(tip["pos"][[0, 2]] - ctx["middle"])) > 30.0:
+        print(f"    WARNING: the tip came back to {fmt(tip['pos'])}, not the middle: it may be caught on something")
 
 
 def drive(ctx, route, target_xyz, tol_mm):
@@ -233,13 +251,17 @@ def cmd_retrieve(cfg, args):
             print("Can't see the green tip. Check the camera view.")
             return
         ctx = {"cfg": cfg, "args": args, "vision": vision, "display": display, "cables": cables,
-               "middle": rest["pos"][[0, 2]].copy(),
+               "rest": rest["pos"].copy(), "middle": rest["pos"][[0, 2]].copy(),
                # approach points are loose waypoints: within ~25 mm of what the cables reach is good enough
                "reachable": reachability(calib, rest["pos"], tol_mm=25.0)}
         ctx["slot_marks"] = [(tuple(p), f"slot {L}", COLOURS[L]) for L, p in slots.items()]
         display.marks = list(ctx["slot_marks"])
         print(f"Tip at the middle: {fmt(rest['pos'])}. Tip length past the marker: {cfg['tip_length_mm']:.0f} mm. "
               + ("Holder slots: " + ", ".join(f"{L} {fmt(p)}" for L, p in slots.items()) if slots else "No holder slots."))
+        for L, p in slots.items():
+            if np.hypot(p[0], p[2]) > cfg["max_radius_mm"] - 10:
+                print(f"WARNING: slot {L} is outside the camera's search circle (max_radius_mm "
+                      f"{cfg['max_radius_mm']:.0f}): a letter put there can't be seen, so placing it can't be checked.")
 
         placed, failed, attempts = set(), {L: [] for L in LETTERS}, {L: 0 for L in LETTERS}
         second_round = False
@@ -260,7 +282,7 @@ def cmd_retrieve(cfg, args):
                 continue
 
             # plan every letter still to do, from the middle
-            plans = {}
+            plans, missing = {}, [L for L in todo if L not in letters]
             for L in todo:
                 if L not in letters:
                     print(f"{L}: not found in the camera view")
@@ -278,7 +300,10 @@ def cmd_retrieve(cfg, args):
                     failed = {L: [] for L in LETTERS}
                     attempts = {L: 0 for L in LETTERS}
                     continue
-                print("No route left to try for " + ", ".join(todo) + ". Stopping.")
+                stuck = [L for L in todo if L not in missing]
+                print((f"No route left to try for {', '.join(stuck)}. " if stuck else "") +
+                      (f"Not found: {', '.join(missing)} (in the grey circle? taught? see `detect`). " if missing else "")
+                      + "Stopping.")
                 break
             L = min(plans, key=lambda k: plans[k][0][0]["cost"])
             route = plans[L][0][0]
@@ -299,7 +324,8 @@ def cmd_retrieve(cfg, args):
             target = letters[L]["pos"]
             display.target_px, display.target_pos = letters[L]["px"], target
             display.lines = [status, f"{L}: attempt {attempts[L]}, from side {route['angle_deg']:.0f} deg"]
-            print(f"{L}: attempt {attempts[L]} from side {route['angle_deg']:.0f} deg, "
+            print(f"{L}: attempt {attempts[L]} " + ("straight in (no side route left), " if route.get("direct") else "")
+                  + f"from side {route['angle_deg']:.0f} deg, "
                   f"{len(route['path']) - 2} corner(s), {route['length']:.0f} mm, magnet at {fmt(target)}")
             started = time.time()
             out = drive(ctx, route, target, args.success_mm)
@@ -429,7 +455,8 @@ def cmd_holder(cfg, args):
                     print("Couldn't get a position there: click on the holder.")
                     continue
                 slots[L] = [round(float(c), 1) for c in pos]
-                print(f"Slot {L}: {fmt(pos)}")
+                print(f"Slot {L}: {fmt(pos)}" + ("   WARNING: outside the camera's search circle, move the holder "
+                                                 "closer to the middle" if np.hypot(pos[0], pos[2]) > cfg["max_radius_mm"] - 10 else ""))
             elif key == ord("c"):
                 slots = {}
     except KeyboardInterrupt:

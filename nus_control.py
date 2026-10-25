@@ -248,6 +248,7 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
                 m = vision.measure_tip(3, on_frame)
                 if m is None:
                     cables.move_angles(start)
+                    vision.forget_tip(expect=base["pos"])
                     raise RuntimeError("Lost the tip during calibration.")
                 if np.linalg.norm(m["px"] - ref["px"]) > TAUT_SHIFT_PX:
                     # a cable being LET OUT also shifts the tip a little (the other cables pull it over),
@@ -268,6 +269,7 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
                     break
             turned_mm = abs(cables.read_angles()[j] - start[j]) * PULLEY_RADIUS_MM   # did the motor follow?
             cables.move_angles(start)
+            vision.forget_tip(expect=base["pos"])
             if found:
                 break
             if let_out:
@@ -297,6 +299,7 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
     #    always spring back when the previous cable is released (friction), and measuring every
     #    cable from the first position then mixes the cables up.
     cables.set_pulls(np.zeros(4))
+    vision.forget_tip(expect=base["pos"])
     taut_tip = vision.measure_tip(10, on_frame)
     if taut_tip is None:
         raise RuntimeError("Lost the tip at the taut pose.")
@@ -435,7 +438,9 @@ def move_tip_adaptive(cables, vision, target, on_frame, tol_mm=4.0, gain=0.7, ma
         err, e_new = errors(tip)
         log(f"  step {it:2d}: error {e_new:5.1f} mm | pulls {np.round(cables.pulls, 1)} mm | "
             f"tip {tip['pos'][1] - target[1]:+.0f} mm above target")
-        if watch is not None and watch(tip):
+        # caught on something (or out of time); not while it is already close: tiny final steps
+        # are normal there, and the stall check below ends those
+        if watch is not None and watch(tip) and (watch.timed_out or e_new > 1.5 * tol_mm):
             return result(False, e_new, it, tip, "stuck")
         progress = float(np.linalg.norm(w * err))
         if progress < best - 0.5:
@@ -454,17 +459,18 @@ class Watchdog:
 
     def __init__(self, stuck_s=3.0, stuck_mm=4.0, timeout_s=60.0):
         self.stuck_s, self.stuck_mm, self.timeout_s = stuck_s, stuck_mm, timeout_s
-        self.start, self.history, self.why = time.time(), [], None
+        self.start, self.history, self.why, self.timed_out = time.time(), [], None, False
 
     def __call__(self, tip):
         now = time.time()
         self.history.append((now, tip["pos"][[0, 2]].copy()))
         if now - self.start > self.timeout_s:
-            self.why = f"took longer than {self.timeout_s:.0f} s"
+            self.why, self.timed_out = f"took longer than {self.timeout_s:.0f} s", True
             return True
-        recent = [p for t, p in self.history if now - t <= self.stuck_s]
-        covered = now - min(t for t, _ in self.history if now - t <= self.stuck_s) if recent else 0.0
-        if covered >= 0.8 * self.stuck_s and len(recent) >= 3 and                 max(np.linalg.norm(p - recent[-1]) for p in recent) < self.stuck_mm:
+        window = [(t, p) for t, p in self.history if now - t <= self.stuck_s]
+        covered = now - window[0][0]                 # how much of the last stuck_s seconds we have seen
+        spread = max(np.linalg.norm(p - window[-1][1]) for _, p in window)
+        if covered >= 0.8 * self.stuck_s and len(window) >= 3 and spread < self.stuck_mm:
             self.why = f"tip stayed within {self.stuck_mm:.0f} mm for {self.stuck_s:.0f} s"
             return True
         return False

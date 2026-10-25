@@ -387,6 +387,7 @@ def cmd_search(cfg, args):
             cables.calib = {**cables.calib, "pull_max_mm": [args.pull_max_mm if s else 0.0
                                                             for s in cables.calib["pull_sign"]]}
         cables.set_pulls(np.zeros(4))
+        vision.forget_tip()
         tip_rest = vision.measure_tip(10, display.show)
         if tip_rest is None:
             print("Can't see the green tip. Check the camera view.")
@@ -424,6 +425,7 @@ def cmd_search(cfg, args):
                     # cables under tension). Let the cables go back to rest so the arm springs free.
                     print("  the tip is stuck (no cable moves it): letting the cables go back to rest first")
                     cables.set_pulls(np.zeros(4))
+                    vision.forget_tip(expect=tip_rest["pos"])
                     J, now = probe_model(cables, vision, display.show)
                 if J is not None:
                     set_live_model(cables, J)
@@ -497,9 +499,11 @@ def cmd_search(cfg, args):
                     # it may be caught on something with the cables under tension: start the next
                     # letter from the rest pose, not from there
                     cables.set_pulls(np.zeros(4))
+                    vision.forget_tip(expect=tip_rest["pos"])
 
             display.target_px = display.target_pos = None
             cables.set_pulls(np.zeros(4))                     # back to the rest pose
+            vision.forget_tip(expect=tip_rest["pos"])
             total = time.time() - trial_start
             display.timer_start = None
             reached = sum(r["success"] for r in rows if r["trial"] == trial and r["letter"] in SEQUENCE)
@@ -605,6 +609,7 @@ def cmd_goto(cfg, args):
             return
         align_to_calibration(cables)            # refuses if a spool moved since calibration
         cables.set_pulls(np.zeros(4))
+        vision.forget_tip()
         for L in order:
             if L not in found:
                 continue
@@ -619,6 +624,7 @@ def cmd_goto(cfg, args):
                 frame, depth = vision.grab()
                 display.show(frame, vision.find_tip(frame, depth))
             cables.set_pulls(np.zeros(4))
+            vision.forget_tip()
     except KeyboardInterrupt:
         print("Stopped.")
     except (RuntimeError, ValueError) as e:

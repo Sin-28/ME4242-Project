@@ -1,7 +1,22 @@
-# Lab checklist: N -> U -> S search (no obstacles)
+# Lab checklist: N-U-S letters with obstacles
 
 Run everything in the `ME4242` conda env from `C:\DEV Folder\ME4242 Project`, with **EMIO Labs closed**.
-In any camera window, **q / Esc stops** and switches the motors off.
+In any camera window, **q / Esc stops** and switches the motors off (Ctrl+C in the terminal too).
+
+## Test-run order (obstacles + holder)
+| # | Command | Motors? | Check before going on |
+|---|---|---|---|
+| 1 | `python nus_main.py check --apply` | no | Tip found; surface height saved |
+| 2 | `python nus_main.py calibrate` | yes | 4 cables, directions roughly 90 deg apart, ~3 mm/mm each, **no** "measured exactly the same" warning |
+| 3 | `python nus_main.py detect` | no | N, U, S green (teach with click + n/u/s if not); one orange outline per obstacle/block, none on the arm, letters or bare platform |
+| 4 | `python nus_main.py holder` | no | Click each slot + n/u/s, q saves; no "outside the camera's search circle" warning |
+| 5 | `python nus_main.py retrieve --dry-run` | no | Each letter has a cyan/grey route that goes round the obstacles; order looks sensible |
+| 6 | `python nus_main.py retrieve --no-place --record` | yes | Reaches each magnet; when caught it gives up after 3 s, goes back to the middle, tries another side |
+| 7 | `python nus_main.py retrieve --record` | yes | Grab -> carry -> slot; read `runs/retrieve_log.csv` afterwards |
+
+Hands out of the camera view while 2, 5, 6, 7 run (a hand counts as an obstacle or hides the tip).
+Keep the holder and letters inside the grey circle. If a block is too tall for the tip to get onto
+from any side, the log says so (`No route left` / `stuck`): lower it or move the letter.
 
 ## 0. Setup (5 min)
 - [ ] EMIO USB **firmly** plugged in + power on (the board has dropped out before).

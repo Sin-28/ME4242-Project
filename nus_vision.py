@@ -28,7 +28,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from nus_path import convex_hull, segment_distance
+from nus_path import convex_hull
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "nus_config.json"
@@ -78,6 +78,7 @@ DEFAULT_CONFIG = {
     "max_area_px": 20000,
     "tip_min_area_px": 30,
     "tip_max_jump_px": 120,          # tip can't jump further than this between frames
+    "tip_max_jump_mm": 60.0,         # ...or than this (3D) between measurements, unless the cables were released
     "tip_max_radius_mm": 170.0,      # green blobs further from the robot axis are background objects
     "tip_y_range_mm": [-330.0, -80.0],   # ...and so are green blobs outside the arm's height range
 }
@@ -262,6 +263,8 @@ class Vision:
         self._roi = None
         self._rays = None
         self.last_tip_px = None
+        self.last_tip_pos = None           # last measured tip (3D): a fresh search prefers the blob nearest it
+        self._tip_expected = False         # last_tip_pos is only where it should be (after a release): no jump limit
         self._tip_misses = 0
 
     # ---------------- camera ----------------
@@ -458,6 +461,13 @@ class Vision:
                 tip = min(reachable, key=lambda t: np.linalg.norm(t["px"] - self.last_tip_px))
                 if np.linalg.norm(tip["px"] - self.last_tip_px) > cfg["tip_max_jump_px"]:
                     tip = None
+            elif self.last_tip_pos is not None:
+                # a green blob far from where the tip just was is something else (the real tip is
+                # hidden): better "not visible" than steering on a wrong position
+                tip = min(reachable, key=lambda t: np.linalg.norm(t["pos"] - self.last_tip_pos))
+                limit = cfg["tip_max_jump_mm"] * (2.0 if self._tip_expected else 1.0)   # expected: roughly there
+                if np.linalg.norm(tip["pos"] - self.last_tip_pos) > limit:
+                    tip = None
             else:
                 tip = max(reachable, key=lambda t: cv2.contourArea(t["contour"]))
             if tip is not None:
@@ -485,7 +495,15 @@ class Vision:
                 on_frame(frame, tip)
         if len(poss) < n // 2 + 1:
             return None
-        return {"px": np.median(pxs, axis=0), "pos": np.median(poss, axis=0)}
+        self.last_tip_pos, self._tip_expected = np.median(poss, axis=0), False
+        return {"px": np.median(pxs, axis=0), "pos": self.last_tip_pos.copy()}
+
+    def forget_tip(self, expect=None):
+        """The tip may have moved far (cables released, the arm sprang back): search the whole view
+        again, preferring the green blob nearest `expect` (e.g. the rest position) if given."""
+        self.last_tip_px = None
+        self.last_tip_pos = None if expect is None else np.asarray(expect, float).copy()
+        self._tip_expected = expect is not None
 
     # ---------------- letters ----------------
 
