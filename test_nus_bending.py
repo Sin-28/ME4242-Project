@@ -320,6 +320,28 @@ class BendingTests(unittest.TestCase):
                     overlay.draw(frame.copy(), frame)
                 self.assertTrue(np.all(overlay.missed == 0))
 
+    def test_hidden_blue_tip_keeps_estimated_angle_from_neighbors(self):
+        frame, settings = self.frame_and_settings()
+        reference, _ = marker_chain(frame, settings)
+        settings["reference_points"] = reference
+        hidden = frame.copy()
+        cv2.circle(hidden, tuple(map(round, reference[4])), 18, (110, 110, 110), -1)
+        overlay = BendingOverlay(True)
+        labels = []
+        real_put_text = cv2.putText
+        def capture_text(image, label, *args, **kwargs):
+            labels.append(label)
+            return real_put_text(image, label, *args, **kwargs)
+        with patch("nus_bending.load_settings", return_value=settings), \
+             patch("nus_bending.cv2.putText", side_effect=capture_text):
+            overlay.draw(frame.copy(), frame)
+            labels.clear()
+            overlay.draw(hidden.copy(), hidden)
+        self.assertEqual(int(np.count_nonzero(overlay.missed)), 1)
+        self.assertIn("~B4", labels)
+        self.assertTrue(any(label.startswith("~") and label.endswith(" deg") for label in labels))
+        self.assertTrue(any("2D estimated" in label for label in labels))
+
     def test_reacquires_saved_pose_after_stale_hue_and_tracking_loss(self):
         frame, settings = self.frame_and_settings()
         reference, _ = marker_chain(frame, settings)

@@ -40,20 +40,23 @@ The preview does not start the motors. If tracking loses the chain, the saved
 reference rings remain visible so that the expected and observed locations can
 be compared. Marker identities follow the manually clicked order. The tip and
 connection line update with tracked positions, and the two largest signed 2D
-bends over 5° are labeled on the image. Angle labels pause while any marker is
-held after a missed detection; recalibrate if the reference rings no longer
-match the rod.
+bends over 5° are labeled on the image. If exactly one blue tip is hidden, its
+position is estimated between its visible neighbors using the saved spacing.
+The estimated marker, its adjacent line segments, and angle labels appear in
+orange with a `~` prefix. This is a 2D estimate; an occluded tip's true depth
+and local curvature cannot be recovered from the RGB image alone. Angles pause
+if the green tip or multiple markers are hidden. Recalibrate if the reference
+rings no longer match the rod.
 After a large bend, the overlay automatically looks for the last fully tracked
 pose and the saved pose, including a shifted return position. A full ordered
-chain is required before angle labels resume. This recovery updates the live
+chain is required before confirmed angle labels resume. This recovery updates the live
 tracker only; it does not overwrite manually saved calibration clicks.
 If two blue tips merge into one image blob during out-of-plane bending, the
 tracker keeps both marker identities at the shared location and labels them in
 cyan. It pauses the angle display until the discs separate in the RGB image.
 The last fully separated pose remains available for automatic reacquisition.
-Visible markers continue updating and stay colored while a missing marker is
-shown in gray. The connection line uses only visible neighboring markers;
-angles resume when the complete chain returns.
+Visible markers continue updating and stay colored. Other missing markers are
+shown in gray, and their connection lines are omitted.
 
 The overlay can also be enabled for existing commands, for example:
 

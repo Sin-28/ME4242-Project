@@ -253,6 +253,28 @@ def bend_sections(points, min_bend=15.0):
     return sections
 
 
+def estimate_hidden_blue(points, missed, base, reference):
+    """Interpolate one occluded blue disc from its visible neighbors."""
+    missing = np.flatnonzero(missed)
+    if len(missing) != 1 or missing[0] == 0:
+        return None
+    index = int(missing[0])
+    points = np.asarray(points, float).copy()
+    reference = np.asarray(reference, float)
+    left = points[index-1]
+    right = points[index+1] if index+1 < MARKER_COUNT else np.asarray(base, float)
+    ref_right = (reference[index+1] if index+1 < MARKER_COUNT else
+                 np.asarray(base, float))
+    ref_left = reference[index-1]
+    span = np.linalg.norm(ref_right-ref_left)
+    actual_span = np.linalg.norm(right-left)
+    if span < 6 or actual_span < 6 or actual_span > 2.5*span:
+        return None
+    fraction = float(np.clip(np.linalg.norm(reference[index]-ref_left)/span, .15, .85))
+    points[index] = left + fraction*(right-left)
+    return points, index
+
+
 class BendingOverlay:
     def __init__(self, enabled=False, config_path=CONFIG_PATH):
         self.enabled = enabled
@@ -547,8 +569,20 @@ class BendingOverlay:
         if base[0] <= points[-1][0]:
             self._text(image, "Bending: base must be right of markers", 0)
             return image
+        estimated_index = None
+        estimated = None
+        if self.missed is not None and np.any(self.missed) and not np.any(self.overlapped):
+            reference = (self.last_good_points if self.last_good_points is not None else
+                         self.settings.get("reference_points"))
+            if reference is not None:
+                estimated = estimate_hidden_blue(points, self.missed, base, reference)
+        if estimated is not None:
+            points, estimated_index = estimated
         ordered = [base] + [tuple(point) for point in points[::-1]]
-        if (self.missed is not None and np.any(self.missed)) or np.any(self.overlapped):
+        angle_unavailable = (np.any(self.overlapped) or
+                             (self.missed is not None and np.any(self.missed) and
+                              estimated_index is None))
+        if angle_unavailable:
             sections_2d = []
             two_d = "angle paused until markers separate" if np.any(self.overlapped) else \
                     "angle paused until all markers are visible"
@@ -556,34 +590,50 @@ class BendingOverlay:
             try:
                 turning_angles(ordered)
             except ValueError:
-                self.last_points = self.missed = None
-                self._text(image, "Bending: marker assignments conflicted; reacquiring", 0)
-                return image
-            sections_2d = sorted(
-                sorted(bend_sections(ordered, min_bend=5.0),
-                       key=lambda section: abs(section[2]), reverse=True)[:2],
-                key=lambda section: section[0],
-            )
-            two_d = ("2D " + (" | ".join(f"B{i} {angle:+.1f} deg" for i, (_, _, angle)
-                                        in enumerate(sections_2d, 1)) if sections_2d else "straight"))
+                if estimated_index is not None:
+                    sections_2d = []
+                    two_d = "2D estimate unavailable for this pose"
+                else:
+                    self.last_points = self.missed = None
+                    self._text(image, "Bending: marker assignments conflicted; reacquiring", 0)
+                    return image
+            else:
+                sections_2d = sorted(
+                    sorted(bend_sections(ordered, min_bend=5.0),
+                           key=lambda section: abs(section[2]), reverse=True)[:2],
+                    key=lambda section: section[0],
+                )
+                prefix = "~" if estimated_index is not None else ""
+                two_d = (("2D estimated " if prefix else "2D ") +
+                         (" | ".join(f"B{i} {prefix}{angle:+.1f} deg"
+                                   for i, (_, _, angle) in enumerate(sections_2d, 1))
+                          if sections_2d else "straight"))
         visible_chain = [True] + ([self.missed[index] == 0 for index in range(MARKER_COUNT-1, -1, -1)]
                                   if self.missed is not None else [True]*MARKER_COUNT)
+        if estimated_index is not None:
+            visible_chain[MARKER_COUNT-estimated_index] = True
         for index in range(len(ordered)-1):
             if visible_chain[index] and visible_chain[index+1]:
                 start = tuple(np.rint(ordered[index]).astype(int))
                 end = tuple(np.rint(ordered[index+1]).astype(int))
                 cv2.line(image, start, end, (0, 0, 0), 6)
-                cv2.line(image, start, end, (0, 255, 255), 3)
+                color = ((0, 165, 255) if estimated_index is not None and
+                         MARKER_COUNT-estimated_index in (index, index+1) else
+                         (0, 255, 255))
+                cv2.line(image, start, end, color, 3)
         cv2.circle(image, tuple(map(int, base)), 12, (0, 0, 255), 3)
         for index, point in enumerate(ordered[1:], 1):
             center = tuple(map(int, point))
             marker_index = MARKER_COUNT-index
-            color = ((140, 140, 140) if not visible_chain[index] else
+            color = ((0, 165, 255) if marker_index == estimated_index else
+                     (140, 140, 140) if not visible_chain[index] else
                      (255, 255, 0) if self.overlapped[marker_index] else
                      (0, 255, 0) if index == MARKER_COUNT else (255, 100, 0))
             cv2.circle(image, center, 13, (0, 0, 0), 6)
             cv2.circle(image, center, 13, color, 4)
-            cv2.putText(image, "T" if index == MARKER_COUNT else f"B{MARKER_COUNT-index}",
+            cv2.putText(image, "T" if index == MARKER_COUNT else
+                        f"~B{marker_index}" if marker_index == estimated_index else
+                        f"B{marker_index}",
                         (center[0]+11, center[1]-10+(16 if self.overlapped[marker_index]
                                                     and marker_index % 2 else 0)),
                         cv2.FONT_HERSHEY_SIMPLEX, .45,
@@ -593,13 +643,14 @@ class BendingOverlay:
                 continue
             center_index = (start + end) // 2
             x, y = np.rint(ordered[center_index]).astype(int)
-            label = f"{angle:+.1f} deg"
+            label = f"{'~' if estimated_index is not None else ''}{angle:+.1f} deg"
             x = int(np.clip(x + 14, 4, max(4, image.shape[1]-125)))
             y = int(np.clip(y - 22, 25, max(25, image.shape[0]-65)))
             cv2.putText(image, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
                         .68, (0, 0, 0), 5)
             cv2.putText(image, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        .68, (0, 255, 255), 2)
+                        .68, (0, 165, 255) if estimated_index is not None else
+                        (0, 255, 255), 2)
         self._text(image, f"Bending: {status} | {two_d}", 0)
         return image
 
