@@ -47,6 +47,8 @@ After a large bend, the overlay automatically looks for the last fully tracked
 pose and the saved pose, including a shifted return position. A full ordered
 chain is required before angle labels resume. This recovery updates the live
 tracker only; it does not overwrite manually saved calibration clicks.
+If two search windows see the same disc, the tracker holds the ambiguous
+identity and reacquires the chain instead of reporting an overlap angle error.
 
 The overlay can also be enabled for existing commands, for example:
 

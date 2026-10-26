@@ -166,6 +166,17 @@ def follow_markers(frame, settings, previous, hue_offset, masks=None):
             found.append(None)
         else:
             found.append((float(x0+np.median(xs)), float(y0+np.median(ys))))
+    # Adjacent search windows can see the same disc when the rod moves quickly.
+    # Keep one identity per visible disc instead of reporting both as found.
+    for index in range(1, len(found)):
+        left, right = found[index-1:index+1]
+        if left is None or right is None:
+            continue
+        gap = np.linalg.norm(np.subtract(previous[index], previous[index-1]))
+        if np.linalg.norm(np.subtract(right, left)) < min(24, max(10, .6*gap)):
+            left_error = np.linalg.norm(np.subtract(left, previous[index-1]))
+            right_error = np.linalg.norm(np.subtract(right, previous[index]))
+            found[index if right_error >= left_error else index-1] = None
     return found
 
 
@@ -253,6 +264,7 @@ class BendingOverlay:
         points = np.asarray(points, float)
         if (not np.all(np.isfinite(points)) or np.any(np.diff(points[:, 0]) <= 4)
                 or self.settings["base"][0] <= points[-1, 0]
+                or np.linalg.norm(points[-1]-self.settings["base"]) < 6
                 or np.any(np.abs(np.diff(points[:, 1])) > 80)):
             return False
         if reference is not None:
@@ -370,6 +382,10 @@ class BendingOverlay:
         return updated.copy(), "10/10" if not held else f"{len(used)}/10 visible; {held} held"
 
     def _stable_indexed(self, detected):
+        if all(point is not None for point in detected) and not self._plausible_chain(
+                detected, self.last_good_points):
+            self.last_points = self.missed = None
+            return None, "marker assignments conflicted; reacquiring markers"
         updated = self.last_points.copy()
         visible = 0
         for index, point in enumerate(detected):
@@ -382,6 +398,10 @@ class BendingOverlay:
         if np.any(self.missed > 5):
             self.last_points = self.missed = None
             return None, "tracking lost; reacquiring markers"
+        if visible == MARKER_COUNT and not self._plausible_chain(
+                updated, self.last_good_points):
+            self.last_points = self.missed = None
+            return None, "marker assignments conflicted; reacquiring markers"
         self.last_points = updated
         if visible == MARKER_COUNT:
             self.last_good_points = updated.copy()
@@ -430,8 +450,9 @@ class BendingOverlay:
         else:
             try:
                 turning_angles(ordered)
-            except ValueError as exc:
-                self._text(image, "Bending: " + str(exc), 0)
+            except ValueError:
+                self.last_points = self.missed = None
+                self._text(image, "Bending: marker assignments conflicted; reacquiring", 0)
                 return image
             sections_2d = sorted(
                 sorted(bend_sections(ordered, min_bend=5.0),

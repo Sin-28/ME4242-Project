@@ -185,6 +185,7 @@ class BendingTests(unittest.TestCase):
         frame, settings = self.frame_and_settings()
         reference, _ = marker_chain(frame, settings)
         overlay = BendingOverlay(True)
+        overlay.settings = settings
         overlay.last_points = np.asarray(reference, float)
         overlay.missed = np.zeros(10, int)
         for _ in range(15):
@@ -216,6 +217,40 @@ class BendingTests(unittest.TestCase):
             cv2.circle(frame, (x, y), 12, (110, 110, 110), -1)
         found = follow_markers(frame, settings, previous, 0)
         self.assertTrue(all(found[index] is None for index in (5, 6, 7, 8)))
+
+    def test_one_disc_in_two_windows_is_not_counted_twice(self):
+        frame = np.full((240, 650, 3), 110, np.uint8)
+        blue, green = (200, 150, 60), (90, 230, 90)
+        previous = [(50, 120), (100, 120), (122, 120)] + [
+            (x, 120) for x in (180, 235, 290, 345, 400, 455, 510)]
+        cv2.circle(frame, previous[0], 10, green, -1)
+        cv2.circle(frame, (111, 120), 15, blue, -1)  # One disc between B1 and B2.
+        for point in previous[3:]:
+            cv2.circle(frame, point, 10, blue, -1)
+        hsv = lambda color: [int(v) for v in cv2.cvtColor(
+            np.uint8([[color]]), cv2.COLOR_BGR2HSV)[0, 0]]
+        settings = {"roi": [25, 80, 540, 90], "blue_hsv": hsv(blue),
+                    "green_hsv": hsv(green)}
+        found = follow_markers(frame, settings, previous, 0)
+        self.assertEqual(sum(point is not None for point in found), 9)
+        self.assertTrue(any(found[index] is None for index in (1, 2)))
+
+    def test_conflicting_assignments_trigger_recovery_before_angle_error(self):
+        previous = np.asarray([(50+i*22, 120) for i in range(10)], float)
+        overlay = BendingOverlay(True)
+        overlay.settings = {"base": [300, 120]}
+        overlay.last_points = previous.copy()
+        overlay.last_good_points = previous.copy()
+        overlay.missed = np.zeros(10, int)
+        duplicate = previous.copy()
+        duplicate[2] = duplicate[1]
+        for _ in range(4):
+            points, status = overlay._stable_indexed(duplicate)
+            if points is None:
+                break
+        self.assertIsNone(points)
+        self.assertIn("reacquiring", status)
+        self.assertTrue(np.array_equal(overlay.last_good_points, previous))
 
     def test_reacquires_saved_pose_after_stale_hue_and_tracking_loss(self):
         frame, settings = self.frame_and_settings()
