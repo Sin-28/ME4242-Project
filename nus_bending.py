@@ -149,8 +149,10 @@ def follow_markers(frame, settings, previous, hue_offset, masks=None):
         green_mask = color_mask(frame, green_target, 9, settings["roi"])
     else:
         blue_mask, green_mask = masks
+    _, components, stats, centroids = cv2.connectedComponentsWithStats(blue_mask)
     height, width = frame.shape[:2]
     found = []
+    component_ids = []
     for index, (x, y) in enumerate(previous):
         x, y = int(round(x)), int(round(y))
         neighbors = [abs(x-previous[j][0]) for j in (index-1, index+1)
@@ -164,19 +166,24 @@ def follow_markers(frame, settings, previous, hue_offset, masks=None):
         ys, xs = np.nonzero(local)
         if len(xs) < (18 if index == 0 else 45):
             found.append(None)
+            component_ids.append(0)
         else:
             found.append((float(x0+np.median(xs)), float(y0+np.median(ys))))
-    # Adjacent search windows can see the same disc when the rod moves quickly.
-    # Keep one identity per visible disc instead of reporting both as found.
-    for index in range(1, len(found)):
-        left, right = found[index-1:index+1]
-        if left is None or right is None:
-            continue
-        gap = np.linalg.norm(np.subtract(previous[index], previous[index-1]))
-        if np.linalg.norm(np.subtract(right, left)) < min(24, max(10, .6*gap)):
-            left_error = np.linalg.norm(np.subtract(left, previous[index-1]))
-            right_error = np.linalg.norm(np.subtract(right, previous[index]))
-            found[index if right_error >= left_error else index-1] = None
+            if index == 0:
+                component_ids.append(0)
+            else:
+                ids = components[y0:y1, x0:x1][local != 0]
+                component_ids.append(int(np.argmax(np.bincount(ids)[1:])+1))
+    # Two blue discs can project onto one blob during out-of-plane bending.
+    # Assign their shared component centroid to both identities so cropped
+    # search windows cannot invent two different positions inside one blob.
+    for index in range(2, len(found)):
+        component = component_ids[index]
+        if (component and component == component_ids[index-1]
+                and stats[component, cv2.CC_STAT_AREA] <= 2500):
+            center = tuple(map(float, centroids[component]))
+            found[index-1] = center
+            found[index] = center
     return found
 
 
@@ -255,15 +262,18 @@ class BendingOverlay:
         self.last_points = None
         self.last_good_points = None
         self.missed = None
+        self.overlapped = np.zeros(MARKER_COUNT, bool)
         self.hue_offset = 0
         self.recovery_ticks = 0
 
-    def _plausible_chain(self, points, reference=None):
+    def _plausible_chain(self, points, reference=None, overlap_pairs=None):
         """Reject a full color match that cannot be the ordered rod."""
         if len(points) != MARKER_COUNT:
             return False
         points = np.asarray(points, float)
-        if (not np.all(np.isfinite(points)) or np.any(np.diff(points[:, 0]) <= 4)
+        if overlap_pairs is None:
+            overlap_pairs = np.zeros(MARKER_COUNT-1, bool)
+        if (not np.all(np.isfinite(points)) or np.any((np.diff(points[:, 0]) <= 4) & ~overlap_pairs)
                 or self.settings["base"][0] <= points[-1, 0]
                 or np.linalg.norm(points[-1]-self.settings["base"]) < 6
                 or np.any(np.abs(np.diff(points[:, 1])) > 80)):
@@ -271,7 +281,7 @@ class BendingOverlay:
         if reference is not None:
             gaps = np.linalg.norm(np.diff(points, axis=0), axis=1)
             saved_gaps = np.linalg.norm(np.diff(reference, axis=0), axis=1)
-            if np.any(gaps < .45*saved_gaps) or np.any(gaps > 2.1*saved_gaps):
+            if np.any((gaps < .45*saved_gaps) & ~overlap_pairs) or np.any(gaps > 2.1*saved_gaps):
                 return False
             shift = np.median(points-reference, axis=0)
             residual = np.linalg.norm(points-reference-shift, axis=1)
@@ -283,6 +293,7 @@ class BendingOverlay:
         self.last_points = np.asarray(points, float)
         self.last_good_points = self.last_points.copy()
         self.missed = np.zeros(MARKER_COUNT, int)
+        self.overlapped[:] = False
         self.hue_offset = offset
         self.recovery_ticks = 0
         return self.last_points.copy(), "10/10 reacquired"
@@ -296,6 +307,7 @@ class BendingOverlay:
                 missed[index] = 0
         self.last_points = points
         self.missed = missed
+        self.overlapped[:] = False
         self.hue_offset = offset
         count = int(np.count_nonzero(missed == 0))
         return points.copy(), f"{count}/10 reacquired; {MARKER_COUNT-count} held"
@@ -308,7 +320,25 @@ class BendingOverlay:
             return False
         return known[-1][1][0] < self.settings["base"][0]
 
-    def _recover(self, frame):
+    def _distinct_blue_components(self, frame, points, offset):
+        """Require separate image blobs before ending an overlap hold."""
+        target = ((self.settings["blue_hsv"][0]+offset) % 180,
+                  *self.settings["blue_hsv"][1:])
+        mask = color_mask(frame, target, 13, self.settings["roi"])
+        _, labels = cv2.connectedComponents(mask)
+        ids = []
+        height, width = labels.shape
+        for x, y in points[1:]:
+            x, y = int(round(x)), int(round(y))
+            patch = labels[max(0, y-4):min(height, y+5),
+                           max(0, x-4):min(width, x+5)]
+            nonzero = patch[patch != 0]
+            if not len(nonzero):
+                return False
+            ids.append(int(np.argmax(np.bincount(nonzero))))
+        return len(set(ids)) == len(ids)
+
+    def _recover(self, frame, allow_partial=True):
         """Reacquire after a bend, including a shifted return pose."""
         references = []
         best_partial = None
@@ -363,10 +393,12 @@ class BendingOverlay:
             candidate, candidate_status = marker_chain(frame, self.settings, None, offset)
             if len(candidate) > len(best):
                 best, status = candidate, candidate_status
-            if (any(self._plausible_chain(candidate, reference) for reference in references)
-                    if references else self._plausible_chain(candidate)):
+            plausible = (any(self._plausible_chain(candidate, reference)
+                             for reference in references) if references else
+                         self._plausible_chain(candidate))
+            if plausible and (allow_partial or self._distinct_blue_components(frame, candidate, offset)):
                 return self._accept_recovery(candidate, offset)
-        if best_partial is not None:
+        if allow_partial and best_partial is not None:
             return self._accept_partial_recovery(*best_partial)
         return None, status
 
@@ -420,8 +452,13 @@ class BendingOverlay:
 
     def _stable_indexed(self, detected):
         detected = list(detected)
+        overlap_pairs = np.zeros(MARKER_COUNT-1, bool)
+        for index in range(1, MARKER_COUNT-1):
+            left, right = detected[index:index+2]
+            if left is not None and right is not None and np.linalg.norm(np.subtract(left, right)) < 4:
+                overlap_pairs[index] = True
         if all(point is not None for point in detected) and not self._plausible_chain(
-                detected, self.last_good_points):
+                detected, self.last_good_points, overlap_pairs):
             reference = self.last_good_points if self.last_good_points is not None else self.last_points
             candidate = np.asarray(detected, float)
             shift = np.median(candidate-reference, axis=0)
@@ -439,23 +476,30 @@ class BendingOverlay:
         visible = 0
         for index, point in enumerate(detected):
             if point is not None and np.linalg.norm(self.last_points[index]-point) <= 45:
-                updated[index] = .65*self.last_points[index]+.35*np.asarray(point)
+                updated[index] = (np.asarray(point) if (index > 0 and overlap_pairs[index-1]) or
+                                  (index < MARKER_COUNT-1 and overlap_pairs[index]) else
+                                  .65*self.last_points[index]+.35*np.asarray(point))
                 self.missed[index] = 0
                 visible += 1
             else:
                 self.missed[index] += 1
         if visible == MARKER_COUNT and not self._plausible_chain(
-                updated, self.last_good_points):
+                updated, self.last_good_points, overlap_pairs):
             reference = self.last_good_points if self.last_good_points is not None else self.last_points
             rejected = int(np.argmax(np.linalg.norm(updated-reference, axis=1)))
             updated[rejected] = self.last_points[rejected]
             self.missed[rejected] += 1
             visible -= 1
         self.last_points = updated
-        if visible == MARKER_COUNT:
+        self.overlapped[:] = False
+        for index, overlapping in enumerate(overlap_pairs):
+            if overlapping and self.missed[index] == self.missed[index+1] == 0:
+                self.overlapped[index:index+2] = True
+        if visible == MARKER_COUNT and not np.any(self.overlapped):
             self.last_good_points = updated.copy()
             self.recovery_ticks = 0
-        return updated.copy(), ("10/10" if visible == 10 else
+        return updated.copy(), (f"10/10; {int(np.count_nonzero(self.overlapped))} overlapped"
+                                if np.any(self.overlapped) else "10/10" if visible == 10 else
                                 f"{visible}/10 visible; {10-visible} held")
 
     def draw(self, image, frame, _depth=None, _vision=None):
@@ -465,6 +509,7 @@ class BendingOverlay:
             self.shape = image.shape[:2]
             self.settings = load_settings(image.shape, self.config_path)
             self.last_points = self.last_good_points = self.missed = None
+            self.overlapped[:] = False
             self.hue_offset = 0
             self.recovery_ticks = 0
             if self.settings is not None and self.settings.get("reference_points") is not None:
@@ -481,11 +526,12 @@ class BendingOverlay:
             points, status = self._stable_indexed(detected)
             if points is None:
                 points, status = self._recover(frame)
-            elif self.missed is not None and np.any(self.missed >= 5):
+            elif (self.missed is not None and np.any(self.missed >= 5)) or np.any(self.overlapped):
                 self.recovery_ticks += 1
                 if self.recovery_ticks >= 3:
                     self.recovery_ticks = 0
-                    recovered, recovery_status = self._recover(frame)
+                    recovered, recovery_status = self._recover(
+                        frame, allow_partial=not np.any(self.overlapped))
                     if recovered is not None:
                         points, status = recovered, recovery_status
         else:
@@ -502,9 +548,10 @@ class BendingOverlay:
             self._text(image, "Bending: base must be right of markers", 0)
             return image
         ordered = [base] + [tuple(point) for point in points[::-1]]
-        if self.missed is not None and np.any(self.missed):
+        if (self.missed is not None and np.any(self.missed)) or np.any(self.overlapped):
             sections_2d = []
-            two_d = "angle paused until all markers are visible"
+            two_d = "angle paused until markers separate" if np.any(self.overlapped) else \
+                    "angle paused until all markers are visible"
         else:
             try:
                 turning_angles(ordered)
@@ -530,12 +577,16 @@ class BendingOverlay:
         cv2.circle(image, tuple(map(int, base)), 12, (0, 0, 255), 3)
         for index, point in enumerate(ordered[1:], 1):
             center = tuple(map(int, point))
+            marker_index = MARKER_COUNT-index
             color = ((140, 140, 140) if not visible_chain[index] else
+                     (255, 255, 0) if self.overlapped[marker_index] else
                      (0, 255, 0) if index == MARKER_COUNT else (255, 100, 0))
             cv2.circle(image, center, 13, (0, 0, 0), 6)
             cv2.circle(image, center, 13, color, 4)
             cv2.putText(image, "T" if index == MARKER_COUNT else f"B{MARKER_COUNT-index}",
-                        (center[0]+11, center[1]-10), cv2.FONT_HERSHEY_SIMPLEX, .45,
+                        (center[0]+11, center[1]-10+(16 if self.overlapped[marker_index]
+                                                    and marker_index % 2 else 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, .45,
                         color, 2)
         for start, end, angle in sections_2d:
             if abs(angle) <= 5.0:

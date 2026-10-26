@@ -218,7 +218,7 @@ class BendingTests(unittest.TestCase):
         found = follow_markers(frame, settings, previous, 0)
         self.assertTrue(all(found[index] is None for index in (5, 6, 7, 8)))
 
-    def test_one_disc_in_two_windows_is_not_counted_twice(self):
+    def test_one_disc_in_two_windows_keeps_both_marker_identities(self):
         frame = np.full((240, 650, 3), 110, np.uint8)
         blue, green = (200, 150, 60), (90, 230, 90)
         previous = [(50, 120), (100, 120), (122, 120)] + [
@@ -232,10 +232,60 @@ class BendingTests(unittest.TestCase):
         settings = {"roi": [25, 80, 540, 90], "blue_hsv": hsv(blue),
                     "green_hsv": hsv(green)}
         found = follow_markers(frame, settings, previous, 0)
-        self.assertEqual(sum(point is not None for point in found), 9)
-        self.assertTrue(any(found[index] is None for index in (1, 2)))
+        self.assertEqual(sum(point is not None for point in found), 10)
+        self.assertLess(np.linalg.norm(np.subtract(found[1], found[2])), 18)
 
-    def test_conflicting_assignments_trigger_recovery_before_angle_error(self):
+        overlay = BendingOverlay(True)
+        overlay.settings = {**settings, "base": [600, 120]}
+        overlay.last_points = np.asarray(previous, float)
+        overlay.last_good_points = overlay.last_points.copy()
+        overlay.missed = np.zeros(10, int)
+        points, status = overlay._stable_indexed(found)
+        self.assertIn("2 overlapped", status)
+        self.assertTrue(overlay.overlapped[1] and overlay.overlapped[2])
+        self.assertEqual(int(np.count_nonzero(overlay.missed)), 0)
+        self.assertLess(np.linalg.norm(points[1]-points[2]), 18)
+        self.assertTrue(np.array_equal(overlay.last_good_points, previous))
+
+    def test_overlapping_blue_tips_stay_drawn_until_they_separate(self):
+        frame = np.full((240, 650, 3), 110, np.uint8)
+        blue, green = (200, 150, 60), (90, 230, 90)
+        previous = [(50, 120), (100, 120), (122, 120)] + [
+            (x, 120) for x in (180, 235, 290, 345, 400, 455, 510)]
+        cv2.circle(frame, previous[0], 10, green, -1)
+        cv2.circle(frame, (111, 120), 15, blue, -1)
+        for point in previous[3:]:
+            cv2.circle(frame, point, 10, blue, -1)
+        hsv = lambda color: [int(v) for v in cv2.cvtColor(
+            np.uint8([[color]]), cv2.COLOR_BGR2HSV)[0, 0]]
+        settings = {"frame_size": [650, 240], "roi": [25, 80, 540, 90],
+                    "base": [600, 120], "blue_hsv": hsv(blue),
+                    "green_hsv": hsv(green), "reference_points": previous}
+        overlay = BendingOverlay(True)
+        labels = []
+        real_put_text = cv2.putText
+        def capture_text(image, label, *args, **kwargs):
+            labels.append(label)
+            return real_put_text(image, label, *args, **kwargs)
+        with patch("nus_bending.load_settings", return_value=settings), \
+             patch("nus_bending.cv2.putText", side_effect=capture_text):
+            for _ in range(6):
+                overlay.draw(frame.copy(), frame)
+        self.assertTrue(overlay.overlapped[1] and overlay.overlapped[2])
+        self.assertTrue(np.all(overlay.missed == 0))
+        self.assertIn("B1", labels)
+        self.assertIn("B2", labels)
+        self.assertTrue(any("angle paused until markers separate" in label for label in labels))
+        separated = frame.copy()
+        cv2.circle(separated, (111, 120), 17, (110, 110, 110), -1)
+        cv2.circle(separated, previous[1], 9, blue, -1)
+        cv2.circle(separated, previous[2], 9, blue, -1)
+        for _ in range(4):
+            overlay.draw(separated.copy(), separated)
+        self.assertFalse(np.any(overlay.overlapped))
+        self.assertTrue(np.all(overlay.missed == 0))
+
+    def test_coincident_blue_assignments_hold_both_without_angle_error(self):
         previous = np.asarray([(50+i*22, 120) for i in range(10)], float)
         overlay = BendingOverlay(True)
         overlay.settings = {"base": [300, 120]}
@@ -246,8 +296,9 @@ class BendingTests(unittest.TestCase):
         duplicate[2] = duplicate[1]
         points, status = overlay._stable_indexed(duplicate)
         self.assertIsNotNone(points)
-        self.assertIn("9/10 visible", status)
-        self.assertGreater(overlay.missed[2], 0)
+        self.assertIn("2 overlapped", status)
+        self.assertEqual(overlay.missed[2], 0)
+        self.assertTrue(overlay.overlapped[1] and overlay.overlapped[2])
         self.assertTrue(np.array_equal(overlay.last_good_points, previous))
 
     def test_visible_markers_remain_tracked_during_long_single_marker_loss(self):

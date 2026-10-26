@@ -47,8 +47,10 @@ After a large bend, the overlay automatically looks for the last fully tracked
 pose and the saved pose, including a shifted return position. A full ordered
 chain is required before angle labels resume. This recovery updates the live
 tracker only; it does not overwrite manually saved calibration clicks.
-If two search windows see the same disc, the tracker holds the ambiguous
-identity and reacquires the chain instead of reporting an overlap angle error.
+If two blue tips merge into one image blob during out-of-plane bending, the
+tracker keeps both marker identities at the shared location and labels them in
+cyan. It pauses the angle display until the discs separate in the RGB image.
+The last fully separated pose remains available for automatic reacquisition.
 Visible markers continue updating and stay colored while a missing marker is
 shown in gray. The connection line uses only visible neighboring markers;
 angles resume when the complete chain returns.
