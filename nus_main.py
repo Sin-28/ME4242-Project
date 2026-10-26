@@ -11,6 +11,7 @@ Run inside the ME4242 conda env, with EMIO Labs closed:
     python nus_main.py goto all --dry-run  # detect and plan only, motors never move
     python nus_main.py search              # N -> U -> S in turn, timed, results saved to runs/
     python nus_main.py search --trials 5 --record   # 5 trials, saves a video of each session
+    python nus_main.py explore             # map where the tip really goes, obstacles in place (after calibrate)
     python nus_main.py holder              # camera only: teach the holder's N, U, S slots
     python nus_main.py retrieve --dry-run  # camera only: show the planned routes
     python nus_main.py retrieve            # pick the letters up, trial and error, into the holder (nus_retrieve.py)
@@ -684,12 +685,23 @@ def main():
                      help=f"most each cable may pull, in mm (default: the calibration's, {PULL_MAX_MM:.0f}); "
                           "more lets the arm bend further (reach further, raise the tip higher)")
     sub.add_parser("holder", help="camera only: teach where each letter's slot in the holder is")
+    p_x = sub.add_parser("explore", help="map where the tip actually goes, obstacles in place (after calibrate)")
+    p_x.add_argument("--pull-max-mm", type=float, default=50.0,
+                     help="most each cable pulls while exploring (default 50, max 60); rows also stop where the "
+                          "tip stops moving or a motor can't pull further")
+    p_x.add_argument("--step-mm", type=float, default=5.0, help="grid step of the pulls (default 5)")
+    p_x.add_argument("--max-ma", type=float, default=1500.0,
+                     help="safety: stop pulling when a motor's current rises by this much (mA, default 1500)")
+    p_x.add_argument("--only", type=lambda t: [int(v.strip().upper().lstrip("M")) for v in t.split(",")], default=None,
+                     metavar="M1[,M2]", help="explore again only the cable pairs with these motors, keep the rest of the map")
     p_r = sub.add_parser("retrieve", help="pick the letters up and put them in the holder, trying other routes "
                                           "when the tip gets stuck")
     p_r.add_argument("--dry-run", action="store_true", help="camera only: show the plan, motors never move")
     p_r.add_argument("--dry-run-s", type=float, default=30.0, help="how long the dry run shows the plan (default 30 s)")
     p_r.add_argument("--no-place", action="store_true", help="only reach each letter's magnet (no holder yet)")
-    p_r.add_argument("--pull-max-mm", type=float, default=25.0, help="most each cable may pull, mm (default 25)")
+    p_r.add_argument("--pull-max-mm", type=float, default=None,
+                     help="most each cable may pull, mm (default: what `explore` used, else 25)")
+    p_r.add_argument("--no-map", action="store_true", help="don't use the workspace map (adaptive controller only)")
     p_r.add_argument("--success-mm", type=float, default=8.0, help="tip this close to the magnet = reached (default 8)")
     p_r.add_argument("--route", choices=("contact", "avoid"), default="contact",
                      help="contact (default): pass --hug-mm from objects; avoid: --clearance-mm from everything")
@@ -715,11 +727,15 @@ def main():
         limit = MAX_TRAVEL_RAD * PULLEY_RADIUS_MM - 10       # margin for spool drift since calibration
         if args.pull_max_mm is not None and not 1 <= args.pull_max_mm <= limit:
             parser.error(f"--pull-max-mm must be between 1 and {limit:.0f} mm of cable")
+    if (args.command in ("explore", "retrieve") and args.pull_max_mm is not None
+            and not 1 <= args.pull_max_mm <= MAX_TRAVEL_RAD * PULLEY_RADIUS_MM - 10):
+        parser.error(f"--pull-max-mm must be between 1 and {MAX_TRAVEL_RAD * PULLEY_RADIUS_MM - 10:.0f} mm of cable")
 
     cfg = load_config()
-    from nus_retrieve import cmd_holder, cmd_retrieve
+    from nus_retrieve import cmd_explore, cmd_holder, cmd_retrieve
     commands = {"check": cmd_check, "detect": cmd_detect, "jog": cmd_jog, "calibrate": cmd_calibrate,
-                "goto": cmd_goto, "search": cmd_search, "holder": cmd_holder, "retrieve": cmd_retrieve}
+                "goto": cmd_goto, "search": cmd_search, "holder": cmd_holder, "retrieve": cmd_retrieve,
+                "explore": cmd_explore}
     commands[args.command](cfg, args)
 
 

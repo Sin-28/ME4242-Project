@@ -5,3 +5,4 @@ __pycache__/
 runs/
 test_output/
 snapshot_*.png
+workspace_map.json

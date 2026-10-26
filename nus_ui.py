@@ -26,6 +26,7 @@ class Display:
         self.path = None                                     # (list of (x, z), height y): planned route
         self.alt_paths = []                                  # other candidate routes, drawn thin
         self.marks = []                                      # (robot (x, y, z), label, BGR colour)
+        self.region = None                                   # (outline [(x, z)], height y): where the tip reaches
         cv2.namedWindow(WINDOW)
 
     def _to_px(self, x, y, z):
@@ -48,6 +49,11 @@ class Display:
                 if p is not None:
                     cv2.putText(image, f"{o['height_mm']:.0f}mm", p, cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                                 (0, 165, 255), 1, cv2.LINE_AA)
+        if self.region is not None:
+            outline, y = self.region
+            ring = np.array([p for p in (self._to_px(x, y, z) for x, z in outline) if p is not None], np.int32)
+            if len(ring) > 2:
+                cv2.polylines(image, [ring], True, (80, 200, 80), 1, cv2.LINE_AA)
         for points, y in self.alt_paths:
             line = np.array([p for p in (self._to_px(x, y, z) for x, z in points) if p is not None], np.int32)
             if len(line) > 1:

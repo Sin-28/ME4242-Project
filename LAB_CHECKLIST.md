@@ -7,14 +7,28 @@ In any camera window, **q / Esc stops** and switches the motors off (Ctrl+C in t
 | # | Command | Motors? | Check before going on |
 |---|---|---|---|
 | 1 | `python nus_main.py check --apply` | no | Tip found; surface height saved |
-| 2 | `python nus_main.py calibrate` | yes | 4 cables, directions roughly 90 deg apart, ~3 mm/mm each, **no** "measured exactly the same" warning |
+| 2 | `python nus_main.py calibrate --pull-signs=1,1,1,1` (all +1 on this set, Oct 20 and Oct 26) | yes | 4 cables pulling in **4 different directions all round** (~90 deg apart); no WARNING about two motors pulling the same way or "measured exactly the same". Without --pull-signs it tries both ways per motor |
+| 2b | `python nus_main.py explore` (**obstacles + holder in place, letters OFF**) | yes | First pulls each cable alone 10 then 20 mm and stops if one doesn't keep moving the tip (= backwards in the calibration). Then a few minutes; prints how far the tip reaches. Re-run after every calibrate or when an obstacle moves |
 | 3 | `python nus_main.py detect` | no | N, U, S green (teach with click + n/u/s if not); one orange outline per obstacle/block, none on the arm, letters or bare platform |
 | 4 | `python nus_main.py holder` | no | Click each slot + n/u/s, q saves; no "outside the camera's search circle" warning |
-| 5 | `python nus_main.py retrieve --dry-run` | no | Each letter has a cyan/grey route that goes round the obstacles; order looks sensible |
+| 5 | `python nus_main.py retrieve --dry-run` | no | Every letter inside the **green outline** (where the tip was seen to reach) with a cyan route round the obstacles; "OUT OF REACH" = move that letter in |
 | 6 | `python nus_main.py retrieve --no-place --record` | yes | Reaches each magnet; when caught it gives up after 3 s, goes back to the middle, tries another side |
 | 7 | `python nus_main.py retrieve --record` | yes | Grab -> carry -> slot; read `runs/retrieve_log.csv` afterwards |
 
-Hands out of the camera view while 2, 5, 6, 7 run (a hand counts as an obstacle or hides the tip).
+Why `explore`: the calibration's straight-line model only holds near the rest pose; the real arm
+bends nonlinearly, a tip resting on the platform sticks and slips, and around the obstacles it leans
+on them or gets caught. `explore` runs with the real set-up (obstacles and holder where they will be
+in the final run; only the letters off, the magnet would pick them up) and pulls every pair of
+neighbouring cables through a grid, each row as far as the arm goes: until the tip stops moving, a
+motor can't pull further, its current rises by `--max-ma` (800 mA) or `--pull-max-mm` (50, max 60).
+`retrieve` then plans each route as a chain of these recorded settings (the tip was really seen
+there, contacts included), keeps clear of the other letters, plays the chain back, and corrects at
+the end with the camera. If an attempt gets stuck, that spot is avoided in the next plan. Move an
+obstacle -> explore again. Without a map it falls back to the old controller and says so.
+The higher the platform, the harder the tip presses on it and the less it moves per mm of cable
+(Oct 20: ~3 mm/mm, Oct 26 with the platform ~24 mm higher: ~1.5 mm/mm): if the reach is too
+small, lower the platform a little or explore with more cable.
+Hands out of the camera view while 2, 2b, 5, 6, 7 run (a hand counts as an obstacle or hides the tip).
 Keep the holder and letters inside the grey circle. If a block is too tall for the tip to get onto
 from any side, the log says so (`No route left` / `stuck`): lower it or move the letter.
 

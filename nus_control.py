@@ -34,7 +34,7 @@ CALIB_PATH = HERE / "cable_calibration.json"
 
 PULLEY_RADIUS_MM = 20.0        # emioapi: _length_to_rad = 1/20
 PROFILE_VELOCITY = 60          # Dynamixel units of 0.229 rev/min -> ~14 rev/min (slow)
-MAX_TRAVEL_RAD = 2.5           # never command a motor more than this (~50 mm of cable) from where it started
+MAX_TRAVEL_RAD = 3.5           # never command a motor more than this (~70 mm of cable) from where it started
 MAX_DRIFT_RAD = 0.5            # spool moved more than this (~10 mm) since calibration -> recalibrate
 
 # Dynamixel X-series control table (XM430-W210)
@@ -125,7 +125,15 @@ class Cables:
                              f"(~{self.max_travel_rad * PULLEY_RADIUS_MM:.0f} mm of cable) from the start position: "
                              f"{np.round(angles, 3)}")
         self.motors.angles = angles
+        self.goal_angles = np.array(angles)
         self._wait(timeout)
+
+    def lag_mm(self):
+        """How far (mm of cable) each motor is from where it was last told to go: a motor that
+        can't get there is pulling as hard as it can (the cable or the arm won't give)."""
+        if getattr(self, "goal_angles", None) is None:
+            return np.zeros(4)
+        return np.abs(self.goal_angles - self.read_angles()) * PULLEY_RADIUS_MM
 
     def _wait(self, timeout, settle=0.15):
         time.sleep(0.05)
@@ -231,58 +239,36 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
     cables.max_travel_rad = max(cables.max_travel_rad, search_mm / PULLEY_RADIUS_MM + 0.1)
     pull_sign, taut = [0] * 4, [float(a) for a in start]
     for j in range(4):
-        found = False
         if pull_signs and pull_signs[j] == 0:
             log(f"Motor {j}: marked unused (--pull-signs 0)")
             continue
         directions = (pull_signs[j],) if pull_signs else (first_direction, -first_direction)
-        for sign in directions:
-            angles = start.copy()
-            # where the tip is now: after the last cable was let out it may not have sprung all the
-            # way back (friction with the platform), and that offset must not count as this cable pulling
-            ref = vision.measure_tip(6, on_frame) or base
-            let_out = False
-            for k in range(1, int(search_mm) + 1):
-                angles[j] = start[j] + sign * k * SEARCH_STEP_RAD
-                cables.move_angles(angles)
-                m = vision.measure_tip(3, on_frame)
-                if m is None:
-                    cables.move_angles(start)
-                    vision.forget_tip(expect=base["pos"])
-                    raise RuntimeError("Lost the tip during calibration.")
-                if np.linalg.norm(m["px"] - ref["px"]) > TAUT_SHIFT_PX:
-                    # a cable being LET OUT also shifts the tip a little (the other cables pull it over),
-                    # then nothing more: a pulling cable keeps moving it. Pull a bit further to tell.
-                    angles[j] = start[j] + sign * (k + CONFIRM_PULL_MM) * SEARCH_STEP_RAD
-                    cables.move_angles(angles)
-                    m2 = vision.measure_tip(3, on_frame)
-                    if m2 is None or np.linalg.norm(m2["px"] - m["px"]) < TAUT_SHIFT_PX:
-                        log(f"Motor {j}: direction {sign:+d} shifted the tip once but it didn't keep moving "
-                            "(that's the cable being let out)" + ("" if pull_signs else ", trying the other way"))
-                        let_out = True
-                        break
-                    pull_sign[j] = sign
-                    taut[j] = float(start[j] + sign * (k - 1) * SEARCH_STEP_RAD)
-                    found = True
-                    log(f"Motor {j}: pulls with direction {sign:+d}, taut after {k - 1} mm "
-                        f"(angle {taut[j]:+.3f} rad)")
-                    break
-            turned_mm = abs(cables.read_angles()[j] - start[j]) * PULLEY_RADIUS_MM   # did the motor follow?
-            cables.move_angles(start)
-            vision.forget_tip(expect=base["pos"])
-            if found:
-                break
-            if let_out:
-                continue
-            commanded_mm = int(search_mm) * SEARCH_STEP_RAD * PULLEY_RADIUS_MM
-            log(f"Motor {j}: no tip movement in direction {sign:+d}. The motor turned {turned_mm:.0f} mm "
-                f"of cable out of {commanded_mm:.0f} mm commanded.")
-            if turned_mm < 0.5 * commanded_mm:
-                raise RuntimeError(f"Motor {j} did not follow its commands: check its power and wiring.")
-        if not found:
-            log(f"Motor {j}: UNUSED - it turned {search_mm:.0f} mm each way without moving the tip. Either no "
-                f"cable is attached to it, or its cable has more slack than that (then wind it in with "
-                f"`python nus_main.py jog` and calibrate again).")
+        trials = [_try_direction(cables, vision, on_frame, start, base, j, sign, search_mm, log) for sign in directions]
+        # a PULLING cable keeps moving the tip further out (and the motor works harder); a cable being
+        # LET OUT moves it a bit too (the other cables pull it over, an arm that was pressed relaxes),
+        # then stops once it is slack: compare how much each direction still moves the tip 4-8 mm on
+        good = [t for t in trials if t["k"] is not None and t["growth_px"] >= TAUT_SHIFT_PX]
+        for t in trials:
+            if t["k"] is not None:
+                rise = "" if t["current_rise"] is None else f", motor current {t['current_rise']:+.0f} mA"
+                log(f"Motor {j} direction {t['sign']:+d}: tip shifted after {t['k']} mm, then moved "
+                    f"{t['growth_px']:.0f} px more over the next 4 mm{rise}")
+        if not good:
+            if any(t["k"] is not None for t in trials):
+                log(f"Motor {j}: the tip shifted but didn't keep moving in any direction tried (only let out?)")
+            log(f"Motor {j}: UNUSED - no direction kept moving the tip. Either no cable is attached to it, or "
+                f"its cable has more slack than {search_mm:.0f} mm (wind it in with `python nus_main.py jog`, "
+                "then calibrate again).")
+            continue
+        currents = [t["current_rise"] for t in good]
+        if len(good) == 2 and None not in currents and abs(currents[0] - currents[1]) > 30.0:
+            pick = max(good, key=lambda t: t["current_rise"])       # pulling tightens: more current
+        else:
+            pick = max(good, key=lambda t: t["growth_px"])
+        pull_sign[j] = pick["sign"]
+        taut[j] = float(start[j] + pick["sign"] * (pick["k"] - 1) * SEARCH_STEP_RAD)
+        log(f"Motor {j}: pulls with direction {pick['sign']:+d}, taut after {pick['k'] - 1} mm "
+            f"(angle {taut[j]:+.3f} rad)")
 
     used = [j for j in range(4) if pull_sign[j] != 0]
     if len(used) < 2:
@@ -332,6 +318,18 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
             log(f"Motor {j}: the tip didn't come back by {np.linalg.norm((back['pos'] - base['pos'])[[0, 2]]):.0f} mm "
                 "after the cable was released (friction with the platform?). The search re-measures the "
                 "cables at every letter, but a freely moving tip calibrates better.")
+    # the cables should pull the tip in clearly different directions, all round: two pulling the same
+    # way with a side that nothing pulls toward means one of them is being let out, not pulled
+    angle = {j: math.degrees(math.atan2(J[2, j], J[0, j])) for j in used if np.linalg.norm(J[[0, 2], j]) > 0.2}
+    ordered = sorted(angle.values())
+    gaps = [((b - a) % 360.0) for a, b in zip(ordered, ordered[1:] + ordered[:1])] if len(ordered) >= 2 else []
+    if len(ordered) >= 3 and max(gaps) > 150.0:
+        for a, b in combinations(angle, 2):
+            if abs((angle[a] - angle[b] + 180.0) % 360.0 - 180.0) < 40.0:
+                log(f"WARNING: motors {a} and {b} both pull the tip toward about {angle[a]:.0f} deg, and no cable "
+                    f"pulls toward the other side ({max(gaps):.0f} deg gap): one of them is probably turning the "
+                    "wrong way (letting its cable out). Check with `python nus_main.py jog` which way tightens "
+                    "each cable, then calibrate with --pull-signs.")
     for a, b in combinations(used, 2):       # two cables that look identical = a measurement went wrong
         if np.linalg.norm(J[:, a] - J[:, b]) < 0.05 * max(np.linalg.norm(J[:, a]), 1e-6) + 1e-3:
             log(f"WARNING: motors {a} and {b} measured exactly the same: the tip probably didn't move for "
@@ -343,6 +341,58 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
     CALIB_PATH.write_text(json.dumps(calib, indent=2))
     log(f"Saved {CALIB_PATH.name}")
     return calib
+
+
+def _try_direction(cables, vision, on_frame, start, base, j, sign, search_mm, log):
+    """Turn motor j in `sign` direction 1 mm at a time until the tip shifts (TAUT_SHIFT_PX), then
+    4 and 8 mm further, and put it back. Returns {"sign", "k": mm at the shift (None: never),
+    "growth_px": how far the tip moved between +4 and +8 mm, "current_rise": motor j's current
+    at +8 mm minus at the start (None if unreadable)}."""
+    angles = start.copy()
+    # where the tip is now: after the last cable was let out it may not have sprung all the
+    # way back (friction with the platform), and that offset must not count as this cable pulling
+    ref = vision.measure_tip(6, on_frame) or base
+    try:
+        current0 = abs(float(cables.read_currents()[j]))
+    except Exception:
+        current0 = None
+    out = {"sign": sign, "k": None, "growth_px": 0.0, "current_rise": None}
+    try:
+        for k in range(1, int(search_mm) + 1):
+            angles[j] = start[j] + sign * k * SEARCH_STEP_RAD
+            cables.move_angles(angles)
+            m = vision.measure_tip(3, on_frame)
+            if m is None:
+                raise RuntimeError("Lost the tip during calibration.")
+            if np.linalg.norm(m["px"] - ref["px"]) > TAUT_SHIFT_PX:
+                out["k"] = k
+                break
+        if out["k"] is None:
+            turned_mm = abs(cables.read_angles()[j] - start[j]) * PULLEY_RADIUS_MM   # did the motor follow?
+            commanded_mm = int(search_mm) * SEARCH_STEP_RAD * PULLEY_RADIUS_MM
+            log(f"Motor {j}: no tip movement in direction {sign:+d} (the motor turned {turned_mm:.0f} of "
+                f"{commanded_mm:.0f} mm commanded)")
+            if turned_mm < 0.5 * commanded_mm:
+                raise RuntimeError(f"Motor {j} did not follow its commands: check its power and wiring.")
+            return out
+        seen = []
+        for extra in (CONFIRM_PULL_MM, 2 * CONFIRM_PULL_MM):
+            angles[j] = start[j] + sign * (out["k"] + extra) * SEARCH_STEP_RAD
+            cables.move_angles(angles)
+            seen.append(vision.measure_tip(3, on_frame))
+        if seen[0] is not None and seen[1] is not None:
+            out["growth_px"] = float(np.linalg.norm(seen[1]["px"] - seen[0]["px"]))
+        if current0 is not None:
+            try:
+                out["current_rise"] = abs(float(cables.read_currents()[j])) - current0
+                if not np.isfinite(out["current_rise"]):
+                    out["current_rise"] = None
+            except Exception:
+                out["current_rise"] = None
+        return out
+    finally:
+        cables.move_angles(start)
+        vision.forget_tip(expect=base["pos"])
 
 
 def reachability(calib, tip_rest, tol_mm=6.0):
@@ -440,7 +490,7 @@ def move_tip_adaptive(cables, vision, target, on_frame, tol_mm=4.0, gain=0.7, ma
             f"tip {tip['pos'][1] - target[1]:+.0f} mm above target")
         # caught on something (or out of time); not while it is already close: tiny final steps
         # are normal there, and the stall check below ends those
-        if watch is not None and watch(tip) and (watch.timed_out or e_new > 1.5 * tol_mm):
+        if watch is not None and watch(tip, cables.pulls) and (watch.timed_out or e_new > 1.5 * tol_mm):
             return result(False, e_new, it, tip, "stuck")
         progress = float(np.linalg.norm(w * err))
         if progress < best - 0.5:
@@ -455,23 +505,30 @@ def move_tip_adaptive(cables, vision, target, on_frame, tol_mm=4.0, gain=0.7, ma
 
 class Watchdog:
     """Tells a move to give up: the tip has stayed within stuck_mm (sideways) for stuck_s seconds
-    while being driven (caught on something), or the whole attempt took longer than timeout_s."""
+    although the cables kept changing (at least stuck_cable_mm in that time: it's caught on
+    something, not just waiting), or the whole attempt took longer than timeout_s.
+    Call it after every measured move: watch(tip, pulls) -> True = give up (reason in .why)."""
 
-    def __init__(self, stuck_s=3.0, stuck_mm=4.0, timeout_s=60.0):
+    def __init__(self, stuck_s=3.0, stuck_mm=4.0, timeout_s=60.0, stuck_cable_mm=8.0):
         self.stuck_s, self.stuck_mm, self.timeout_s = stuck_s, stuck_mm, timeout_s
+        self.stuck_cable_mm = stuck_cable_mm
         self.start, self.history, self.why, self.timed_out = time.time(), [], None, False
 
-    def __call__(self, tip):
+    def __call__(self, tip, pulls=None):
         now = time.time()
-        self.history.append((now, tip["pos"][[0, 2]].copy()))
+        self.history.append((now, tip["pos"][[0, 2]].copy(), None if pulls is None else np.array(pulls, float)))
         if now - self.start > self.timeout_s:
             self.why, self.timed_out = f"took longer than {self.timeout_s:.0f} s", True
             return True
-        window = [(t, p) for t, p in self.history if now - t <= self.stuck_s]
+        window = [h for h in self.history if now - h[0] <= self.stuck_s]
         covered = now - window[0][0]                 # how much of the last stuck_s seconds we have seen
-        spread = max(np.linalg.norm(p - window[-1][1]) for _, p in window)
-        if covered >= 0.8 * self.stuck_s and len(window) >= 3 and spread < self.stuck_mm:
-            self.why = f"tip stayed within {self.stuck_mm:.0f} mm for {self.stuck_s:.0f} s"
+        spread = max(np.linalg.norm(p - window[-1][1]) for _, p, _ in window)
+        cable = [q for _, _, q in window if q is not None]
+        driven = sum(np.abs(b - a).sum() for a, b in zip(cable, cable[1:])) if len(cable) == len(window) else math.inf
+        if (covered >= 0.8 * self.stuck_s and len(window) >= 3 and spread < self.stuck_mm
+                and driven >= self.stuck_cable_mm):
+            self.why = (f"tip stayed within {self.stuck_mm:.0f} mm for {self.stuck_s:.0f} s"
+                        + (f" while the cables moved {driven:.0f} mm" if driven != math.inf else ""))
             return True
         return False
 
