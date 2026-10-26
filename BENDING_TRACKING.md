@@ -43,6 +43,10 @@ connection line update with tracked positions, and the two largest signed 2D
 bends over 5° are labeled on the image. Angle labels pause while any marker is
 held after a missed detection; recalibrate if the reference rings no longer
 match the rod.
+After a large bend, the overlay automatically looks for the last fully tracked
+pose and the saved pose, including a shifted return position. A full ordered
+chain is required before angle labels resume. This recovery updates the live
+tracker only; it does not overwrite manually saved calibration clicks.
 
 The overlay can also be enabled for existing commands, for example:
 

@@ -140,12 +140,15 @@ def marker_chain(frame, settings, previous=None, hue_offset=0):
     return points, f"markers {len(points)}/{MARKER_COUNT}"
 
 
-def follow_markers(frame, settings, previous, hue_offset):
+def follow_markers(frame, settings, previous, hue_offset, masks=None):
     """Find each known marker in a small window around its last location."""
     blue_target = ((settings["blue_hsv"][0]+hue_offset) % 180, *settings["blue_hsv"][1:])
     green_target = ((settings["green_hsv"][0]+hue_offset) % 180, *settings["green_hsv"][1:])
-    blue_mask = color_mask(frame, blue_target, 13, settings["roi"])
-    green_mask = color_mask(frame, green_target, 9, settings["roi"])
+    if masks is None:
+        blue_mask = color_mask(frame, blue_target, 13, settings["roi"])
+        green_mask = color_mask(frame, green_target, 9, settings["roi"])
+    else:
+        blue_mask, green_mask = masks
     height, width = frame.shape[:2]
     found = []
     for index, (x, y) in enumerate(previous):
@@ -239,31 +242,85 @@ class BendingOverlay:
         self.settings = None
         self.shape = None
         self.last_points = None
+        self.last_good_points = None
         self.missed = None
         self.hue_offset = 0
 
-    def _recover(self, frame):
-        """Retry the saved straight pose and the original hue after tracking loss."""
-        reference = self.settings.get("reference_points")
+    def _plausible_chain(self, points, reference=None):
+        """Reject a full color match that cannot be the ordered rod."""
+        if len(points) != MARKER_COUNT:
+            return False
+        points = np.asarray(points, float)
+        if (not np.all(np.isfinite(points)) or np.any(np.diff(points[:, 0]) <= 4)
+                or self.settings["base"][0] <= points[-1, 0]
+                or np.any(np.abs(np.diff(points[:, 1])) > 80)):
+            return False
         if reference is not None:
-            previous = np.asarray(reference, float)
-            for offset in (self.hue_offset, 0, 10, -10, 20, -20):
-                found = follow_markers(frame, self.settings, previous, offset)
-                if all(point is not None for point in found):
-                    self.last_points = np.asarray(found, float)
-                    self.missed = np.zeros(MARKER_COUNT, int)
-                    self.hue_offset = offset
-                    return self.last_points.copy(), "10/10 reacquired"
+            gaps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+            saved_gaps = np.linalg.norm(np.diff(reference, axis=0), axis=1)
+            if np.any(gaps < .45*saved_gaps) or np.any(gaps > 2.1*saved_gaps):
+                return False
+            shift = np.median(points-reference, axis=0)
+            residual = np.linalg.norm(points-reference-shift, axis=1)
+            if np.quantile(residual, .8) > 35 or np.max(residual) > 70:
+                return False
+        return True
+
+    def _accept_recovery(self, points, offset):
+        self.last_points = np.asarray(points, float)
+        self.last_good_points = self.last_points.copy()
+        self.missed = np.zeros(MARKER_COUNT, int)
+        self.hue_offset = offset
+        return self.last_points.copy(), "10/10 reacquired"
+
+    def _recover(self, frame):
+        """Reacquire after a bend, including a shifted return pose."""
+        references = []
+        for reference in (self.last_good_points, self.settings.get("reference_points")):
+            if reference is not None:
+                reference = np.asarray(reference, float)
+                if not any(np.allclose(reference, other) for other in references):
+                    references.append(reference)
+        roi = self.settings["roi"]
+        for offset in dict.fromkeys((self.hue_offset, 0, 10, -10, 20, -20)):
+            blue_target = ((self.settings["blue_hsv"][0]+offset) % 180,
+                           *self.settings["blue_hsv"][1:])
+            green_target = ((self.settings["green_hsv"][0]+offset) % 180,
+                            *self.settings["green_hsv"][1:])
+            masks = (color_mask(frame, blue_target, 13, roi),
+                     color_mask(frame, green_target, 9, roi))
+            contours, _ = cv2.findContours(masks[1], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            tips = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                x, y, w, h = cv2.boundingRect(contour)
+                if not (100 <= area <= 3000 and w >= 8 and h >= 8
+                        and max(w/h, h/w) <= 2.5):
+                    continue
+                moments = cv2.moments(contour)
+                if moments["m00"]:
+                    tips.append(np.array([moments["m10"]/moments["m00"],
+                                          moments["m01"]/moments["m00"]]))
+            for reference in references:
+                for tip in sorted(tips, key=lambda point: np.linalg.norm(point-reference[0])):
+                    shift = tip-reference[0]
+                    if np.linalg.norm(shift) > 180:
+                        continue
+                    translated = reference+shift
+                    found = follow_markers(frame, self.settings, translated, offset, masks)
+                    if all(point is not None for point in found) and self._plausible_chain(found, reference):
+                        return self._accept_recovery(found, offset)
+                found = follow_markers(frame, self.settings, reference, offset, masks)
+                if all(point is not None for point in found) and self._plausible_chain(found, reference):
+                    return self._accept_recovery(found, offset)
         best, status = [], "markers 0/10"
         for offset in dict.fromkeys((self.hue_offset, 0, 5, -5, 10, -10, 15, -15, 20, -20)):
             candidate, candidate_status = marker_chain(frame, self.settings, None, offset)
             if len(candidate) > len(best):
                 best, status = candidate, candidate_status
-            if len(candidate) == MARKER_COUNT:
-                self.last_points = np.asarray(candidate, float)
-                self.missed = np.zeros(MARKER_COUNT, int)
-                self.hue_offset = offset
-                return self.last_points.copy(), "10/10 reacquired"
+            if (any(self._plausible_chain(candidate, reference) for reference in references)
+                    if references else self._plausible_chain(candidate)):
+                return self._accept_recovery(candidate, offset)
         return None, status
 
     def _current_hue_offset(self, frame):
@@ -326,6 +383,8 @@ class BendingOverlay:
             self.last_points = self.missed = None
             return None, "tracking lost; reacquiring markers"
         self.last_points = updated
+        if visible == MARKER_COUNT:
+            self.last_good_points = updated.copy()
         return updated.copy(), ("10/10" if visible == 10 else
                                 f"{visible}/10 visible; {10-visible} held")
 
@@ -335,10 +394,11 @@ class BendingOverlay:
         if self.shape != image.shape[:2]:
             self.shape = image.shape[:2]
             self.settings = load_settings(image.shape, self.config_path)
-            self.last_points = self.missed = None
+            self.last_points = self.last_good_points = self.missed = None
             self.hue_offset = 0
             if self.settings is not None and self.settings.get("reference_points") is not None:
                 self.last_points = np.asarray(self.settings["reference_points"], float)
+                self.last_good_points = self.last_points.copy()
                 self.missed = np.zeros(MARKER_COUNT, int)
         if self.settings is None:
             self._text(image, "Bending: run `python nus_main.py bending-setup`", 0)

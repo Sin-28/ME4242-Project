@@ -229,6 +229,34 @@ class BendingTests(unittest.TestCase):
         self.assertEqual(len(points), 10, status)
         self.assertIsNotNone(overlay.last_points)
 
+    def test_auto_reacquires_shifted_return_pose_without_global_search(self):
+        frame, settings = self.frame_and_settings()
+        reference, _ = marker_chain(frame, settings)
+        settings["reference_points"] = reference
+        shifted = cv2.warpAffine(frame, np.float32([[1, 0, 20], [0, 1, 35]]),
+                                 (frame.shape[1], frame.shape[0]), borderValue=(110, 110, 110))
+        overlay = BendingOverlay(True)
+        overlay.settings = settings
+        overlay.last_good_points = np.asarray(reference, float)
+        overlay.last_points = None  # A large bend previously lost the chain.
+        with patch("nus_bending.marker_chain", side_effect=AssertionError("global search should not be needed")):
+            points, status = overlay._recover(shifted)
+        self.assertEqual(status, "10/10 reacquired")
+        self.assertLess(np.max(np.linalg.norm(points-(np.asarray(reference)+[20, 35]), axis=1)), 4)
+
+    def test_recovery_rejects_background_chain_with_wrong_spacing(self):
+        frame, settings = self.frame_and_settings()
+        reference, _ = marker_chain(frame, settings)
+        settings["reference_points"] = reference
+        overlay = BendingOverlay(True)
+        overlay.settings = settings
+        wrong = np.asarray(reference, float)
+        wrong[5:, 0] += 160
+        self.assertFalse(overlay._plausible_chain(wrong, reference))
+        wrong = np.asarray(reference, float)
+        wrong[5:, 1] += 75
+        self.assertFalse(overlay._plausible_chain(wrong, reference))
+
 
 if __name__ == "__main__":
     unittest.main()
