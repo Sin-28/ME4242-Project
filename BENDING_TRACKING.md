@@ -52,8 +52,12 @@ pose and the saved pose, including a shifted return position. A full ordered
 chain is required before confirmed angle labels resume. This recovery updates the live
 tracker only; it does not overwrite manually saved calibration clicks.
 If two blue tips merge into one image blob during out-of-plane bending, the
-tracker keeps both marker identities at the shared location and labels them in
-cyan. It pauses the angle display until the discs separate in the RGB image.
+tracker checks the blue blob's shape for two distinct centers. Partly touching
+tips keep separate marker overlays. If the RGB blob has only one discernible
+center, the tracker keeps both identities at the shared location in cyan and
+pauses the angle display until the discs separate in the RGB image. The tracker
+uses marker colors, blue blob shape, and prior positions; it does not segment
+the full rod silhouette.
 The last fully separated pose remains available for automatic reacquisition.
 Visible markers continue updating and stay colored. Other missing markers are
 shown in gray, and their connection lines are omitted.

@@ -247,6 +247,33 @@ class BendingTests(unittest.TestCase):
         self.assertLess(np.linalg.norm(points[1]-points[2]), 18)
         self.assertTrue(np.array_equal(overlay.last_good_points, previous))
 
+    def test_partly_touching_blue_tips_keep_separate_centers(self):
+        frame = np.full((240, 650, 3), 110, np.uint8)
+        blue, green = (200, 150, 60), (90, 230, 90)
+        previous = [(50, 120), (100, 120), (122, 120)] + [
+            (x, 120) for x in (180, 235, 290, 345, 400, 455, 510)]
+        cv2.circle(frame, previous[0], 10, green, -1)
+        cv2.circle(frame, (104, 120), 10, blue, -1)
+        cv2.circle(frame, (118, 120), 10, blue, -1)
+        for point in previous[3:]:
+            cv2.circle(frame, point, 10, blue, -1)
+        hsv = lambda color: [int(v) for v in cv2.cvtColor(
+            np.uint8([[color]]), cv2.COLOR_BGR2HSV)[0, 0]]
+        settings = {"roi": [25, 80, 540, 90], "base": [600, 120],
+                    "blue_hsv": hsv(blue), "green_hsv": hsv(green)}
+        found = follow_markers(frame, settings, previous, 0)
+        self.assertAlmostEqual(found[1][0], 104, delta=2)
+        self.assertAlmostEqual(found[2][0], 118, delta=2)
+        overlay = BendingOverlay(True)
+        overlay.settings = settings
+        overlay.last_points = np.asarray(previous, float)
+        overlay.last_good_points = overlay.last_points.copy()
+        overlay.missed = np.zeros(10, int)
+        points, status = overlay._stable_indexed(found)
+        self.assertEqual(status, "10/10")
+        self.assertFalse(np.any(overlay.overlapped))
+        self.assertGreater(points[2][0]-points[1][0], 10)
+
     def test_overlapping_blue_tips_stay_drawn_until_they_separate(self):
         frame = np.full((240, 650, 3), 110, np.uint8)
         blue, green = (200, 150, 60), (90, 230, 90)

@@ -64,6 +64,40 @@ def color_mask(frame, target, tolerance, roi):
                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
 
+def split_touching_blue_discs(components, stats, centroid, component, left, right):
+    """Find two shape peaks inside a touching blue blob, if both are visible."""
+    x, y, width, height, _ = stats[component]
+    patch = np.pad((components[y:y+height, x:x+width] == component).astype(np.uint8), 1)
+    distance = cv2.distanceTransform(patch, cv2.DIST_L2, 5)[1:-1, 1:-1]
+    axis = np.asarray(right, float)-np.asarray(left, float)
+    previous_gap = np.linalg.norm(axis)
+    if previous_gap < 4:
+        return None
+    axis /= previous_gap
+    yy, xx = np.indices(distance.shape)
+    projection = (xx+x-centroid[0])*axis[0] + (yy+y-centroid[1])*axis[1]
+    halves = (np.where(projection < 0, distance, 0),
+              np.where(projection >= 0, distance, 0))
+    peaks = []
+    for half in halves:
+        row, col = np.unravel_index(np.argmax(half), half.shape)
+        strength = float(half[row, col])
+        if strength < 4:
+            return None
+        peaks.append((np.array([x+col, y+row], float), strength))
+    separation = np.linalg.norm(peaks[1][0]-peaks[0][0])
+    if not (max(6, .3*previous_gap) <= separation <= 1.7*previous_gap):
+        return None
+    if min(peaks[0][1], peaks[1][1]) < .55*max(peaks[0][1], peaks[1][1]):
+        return None
+    path = np.linspace(peaks[0][0], peaks[1][0], max(3, int(separation)+1))
+    columns = np.clip(np.rint(path[:, 0]-x).astype(int), 0, width-1)
+    rows = np.clip(np.rint(path[:, 1]-y).astype(int), 0, height-1)
+    if float(np.min(distance[rows, columns])) > .94*min(peaks[0][1], peaks[1][1]):
+        return None
+    return tuple(map(tuple, (peaks[0][0], peaks[1][0])))
+
+
 def marker_chain(frame, settings, previous=None, hue_offset=0):
     """Locate colored discs along image x; returns left-to-right centers."""
     roi = settings["roi"]
@@ -174,16 +208,18 @@ def follow_markers(frame, settings, previous, hue_offset, masks=None):
             else:
                 ids = components[y0:y1, x0:x1][local != 0]
                 component_ids.append(int(np.argmax(np.bincount(ids)[1:])+1))
-    # Two blue discs can project onto one blob during out-of-plane bending.
-    # Assign their shared component centroid to both identities so cropped
-    # search windows cannot invent two different positions inside one blob.
+    # Touching discs can form one color component while retaining two lobes.
+    # Split only when its shape has two distinct distance-transform peaks.
     for index in range(2, len(found)):
         component = component_ids[index]
         if (component and component == component_ids[index-1]
                 and stats[component, cv2.CC_STAT_AREA] <= 2500):
-            center = tuple(map(float, centroids[component]))
-            found[index-1] = center
-            found[index] = center
+            peaks = split_touching_blue_discs(
+                components, stats, centroids[component], component,
+                previous[index-1], previous[index])
+            if peaks is None:
+                peaks = (tuple(map(float, centroids[component])),)*2
+            found[index-1], found[index] = peaks
     return found
 
 
