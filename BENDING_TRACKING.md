@@ -25,8 +25,9 @@ Add `--camera N` if the RGB camera is not index 0. In the setup window:
    restart the sequence.
 5. Press `s` to save and `q` to close.
 
-The setup saves `bending_config.json` locally. It reloads the settings when the
-RGB frame size matches. A new ROI clears the saved marker sequence.
+The setup saves `bending_config.json` locally. The RGB camera requests its saved
+frame size before capturing, and the overlay reloads settings when the actual
+frame size matches. A new ROI clears the saved marker sequence.
 
 ## Preview
 
@@ -39,7 +40,8 @@ The preview does not start the motors. If tracking loses the chain, the saved
 reference rings remain visible so that the expected and observed locations can
 be compared. Marker identities follow the manually clicked order. The tip and
 connection line update with tracked positions, and signed 2D bends over 5°
-are labeled on the image.
+are labeled on the image. Angle labels pause while any marker is held after a
+missed detection; recalibrate if the reference rings no longer match the rod.
 
 The overlay can also be enabled for existing commands, for example:
 

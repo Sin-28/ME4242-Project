@@ -364,14 +364,18 @@ class BendingOverlay:
             self._text(image, "Bending: base must be right of markers", 0)
             return image
         ordered = [base] + [tuple(point) for point in points[::-1]]
-        try:
-            turns = turning_angles(ordered)
-        except ValueError as exc:
-            self._text(image, "Bending: " + str(exc), 0)
-            return image
-        sections_2d = bend_sections(ordered, min_bend=5.0)
-        two_d = ("2D " + (" | ".join(f"B{i} {angle:+.1f} deg" for i, (_, _, angle)
-                                    in enumerate(sections_2d, 1)) if sections_2d else "straight"))
+        if self.missed is not None and np.any(self.missed):
+            sections_2d = []
+            two_d = "angle paused until all markers are visible"
+        else:
+            try:
+                turning_angles(ordered)
+            except ValueError as exc:
+                self._text(image, "Bending: " + str(exc), 0)
+                return image
+            sections_2d = bend_sections(ordered, min_bend=5.0)
+            two_d = ("2D " + (" | ".join(f"B{i} {angle:+.1f} deg" for i, (_, _, angle)
+                                        in enumerate(sections_2d, 1)) if sections_2d else "straight"))
         cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 0, 0), 6)
         cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 255, 255), 3)
         cv2.circle(image, tuple(map(int, base)), 12, (0, 0, 255), 3)
@@ -550,6 +554,12 @@ class RGBCamera:
         self.capture = cv2.VideoCapture(index)
         if not self.capture.isOpened():
             raise RuntimeError(f"Could not open RGB camera {index}")
+        try:
+            width, height = json.loads(CONFIG_PATH.read_text())["frame_size"]
+        except (OSError, ValueError, TypeError, KeyError):
+            width, height = 1280, 720
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.frame = None
 
     def update(self):

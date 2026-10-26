@@ -6,7 +6,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from nus_bending import (BendingOverlay, add_manual_marker, bend_sections, follow_markers, load_settings, marker_chain,
+from nus_bending import (BendingOverlay, RGBCamera, add_manual_marker, bend_sections, follow_markers, load_settings, marker_chain,
                          save_settings, split_two_bends, turning_angles)
 
 
@@ -87,6 +87,34 @@ class BendingTests(unittest.TestCase):
         self.assertIn("T", labels)
         self.assertTrue(any(label.endswith(" deg") and label.startswith(("+", "-"))
                             for label in labels))
+
+    def test_camera_requests_saved_frame_size_before_reading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"bending.json"
+            path.write_text('{"frame_size": [1280, 720]}')
+            with patch("nus_bending.CONFIG_PATH", path), \
+                 patch("nus_bending.cv2.VideoCapture") as capture:
+                capture.return_value.isOpened.return_value = True
+                camera = RGBCamera()
+                camera.close()
+            capture.return_value.set.assert_any_call(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            capture.return_value.set.assert_any_call(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    def test_angle_pauses_while_saved_marker_is_held(self):
+        frame, settings = self.frame_and_settings()
+        reference, _ = marker_chain(frame, settings)
+        settings["reference_points"] = reference
+        blank = np.full_like(frame, 110)
+        labels = []
+        real_put_text = cv2.putText
+        def capture_text(image, label, *args, **kwargs):
+            labels.append(label)
+            return real_put_text(image, label, *args, **kwargs)
+        with patch("nus_bending.load_settings", return_value=settings), \
+             patch("nus_bending.cv2.putText", side_effect=capture_text):
+            BendingOverlay(True).draw(blank.copy(), blank, None, None)
+        self.assertTrue(any("angle paused" in label for label in labels))
+        self.assertFalse(any(label.endswith(" deg") for label in labels))
 
     def test_disabled_overlay_is_inert(self):
         frame, _ = self.frame_and_settings()
