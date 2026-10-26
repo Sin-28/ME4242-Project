@@ -81,7 +81,7 @@ class BendingTests(unittest.TestCase):
             return real_put_text(image, text, *args, **kwargs)
         with patch("nus_bending.load_settings", return_value=settings), \
              patch("nus_bending.cv2.putText", side_effect=capture_text), \
-             patch("nus_bending.cv2.polylines", wraps=cv2.polylines) as lines:
+             patch("nus_bending.cv2.line", wraps=cv2.line) as lines:
             overlay.draw(frame.copy(), frame, None, None)
         self.assertTrue(lines.called)
         self.assertIn("T", labels)
@@ -244,13 +244,30 @@ class BendingTests(unittest.TestCase):
         overlay.missed = np.zeros(10, int)
         duplicate = previous.copy()
         duplicate[2] = duplicate[1]
-        for _ in range(4):
-            points, status = overlay._stable_indexed(duplicate)
-            if points is None:
-                break
-        self.assertIsNone(points)
-        self.assertIn("reacquiring", status)
+        points, status = overlay._stable_indexed(duplicate)
+        self.assertIsNotNone(points)
+        self.assertIn("9/10 visible", status)
+        self.assertGreater(overlay.missed[2], 0)
         self.assertTrue(np.array_equal(overlay.last_good_points, previous))
+
+    def test_visible_markers_remain_tracked_during_long_single_marker_loss(self):
+        frame, settings = self.frame_and_settings()
+        reference, _ = marker_chain(frame, settings)
+        settings["reference_points"] = reference
+        for missing_index in (0, 4):
+            with self.subTest(missing_index=missing_index):
+                missing_frame = frame.copy()
+                cv2.circle(missing_frame, tuple(map(round, reference[missing_index])),
+                           18, (110, 110, 110), -1)
+                overlay = BendingOverlay(True)
+                with patch("nus_bending.load_settings", return_value=settings):
+                    overlay.draw(frame.copy(), frame)
+                    for _ in range(9):
+                        overlay.draw(missing_frame.copy(), missing_frame)
+                    self.assertIsNotNone(overlay.last_points)
+                    self.assertEqual(int(np.count_nonzero(overlay.missed == 0)), 9)
+                    overlay.draw(frame.copy(), frame)
+                self.assertTrue(np.all(overlay.missed == 0))
 
     def test_reacquires_saved_pose_after_stale_hue_and_tracking_loss(self):
         frame, settings = self.frame_and_settings()

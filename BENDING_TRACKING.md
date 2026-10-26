@@ -49,6 +49,9 @@ chain is required before angle labels resume. This recovery updates the live
 tracker only; it does not overwrite manually saved calibration clicks.
 If two search windows see the same disc, the tracker holds the ambiguous
 identity and reacquires the chain instead of reporting an overlap angle error.
+Visible markers continue updating and stay colored while a missing marker is
+shown in gray. The connection line uses only visible neighboring markers;
+angles resume when the complete chain returns.
 
 The overlay can also be enabled for existing commands, for example:
 

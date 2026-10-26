@@ -256,6 +256,7 @@ class BendingOverlay:
         self.last_good_points = None
         self.missed = None
         self.hue_offset = 0
+        self.recovery_ticks = 0
 
     def _plausible_chain(self, points, reference=None):
         """Reject a full color match that cannot be the ordered rod."""
@@ -283,11 +284,41 @@ class BendingOverlay:
         self.last_good_points = self.last_points.copy()
         self.missed = np.zeros(MARKER_COUNT, int)
         self.hue_offset = offset
+        self.recovery_ticks = 0
         return self.last_points.copy(), "10/10 reacquired"
+
+    def _accept_partial_recovery(self, found, reference, offset):
+        points = np.asarray(reference, float).copy()
+        missed = np.ones(MARKER_COUNT, int)
+        for index, point in enumerate(found):
+            if point is not None:
+                points[index] = point
+                missed[index] = 0
+        self.last_points = points
+        self.missed = missed
+        self.hue_offset = offset
+        count = int(np.count_nonzero(missed == 0))
+        return points.copy(), f"{count}/10 reacquired; {MARKER_COUNT-count} held"
+
+    def _plausible_partial(self, found):
+        known = [(index, point) for index, point in enumerate(found) if point is not None]
+        if len(known) < 7:
+            return False
+        if any(right[1][0]-left[1][0] <= 4 for left, right in zip(known, known[1:])):
+            return False
+        return known[-1][1][0] < self.settings["base"][0]
 
     def _recover(self, frame):
         """Reacquire after a bend, including a shifted return pose."""
         references = []
+        best_partial = None
+        best_count = 0
+        def consider(found, reference, offset):
+            nonlocal best_partial, best_count
+            count = sum(point is not None for point in found)
+            if count > best_count and self._plausible_partial(found):
+                best_count = count
+                best_partial = (found, reference, offset)
         for reference in (self.last_good_points, self.settings.get("reference_points")):
             if reference is not None:
                 reference = np.asarray(reference, float)
@@ -322,9 +353,11 @@ class BendingOverlay:
                     found = follow_markers(frame, self.settings, translated, offset, masks)
                     if all(point is not None for point in found) and self._plausible_chain(found, reference):
                         return self._accept_recovery(found, offset)
+                    consider(found, translated, offset)
                 found = follow_markers(frame, self.settings, reference, offset, masks)
                 if all(point is not None for point in found) and self._plausible_chain(found, reference):
                     return self._accept_recovery(found, offset)
+                consider(found, reference, offset)
         best, status = [], "markers 0/10"
         for offset in dict.fromkeys((self.hue_offset, 0, 5, -5, 10, -10, 15, -15, 20, -20)):
             candidate, candidate_status = marker_chain(frame, self.settings, None, offset)
@@ -333,6 +366,8 @@ class BendingOverlay:
             if (any(self._plausible_chain(candidate, reference) for reference in references)
                     if references else self._plausible_chain(candidate)):
                 return self._accept_recovery(candidate, offset)
+        if best_partial is not None:
+            return self._accept_partial_recovery(*best_partial)
         return None, status
 
     def _current_hue_offset(self, frame):
@@ -342,7 +377,9 @@ class BendingOverlay:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         height, width = hsv.shape[:2]
         hues = []
-        for x, y in self.last_points[1:]:
+        for index, (x, y) in enumerate(self.last_points[1:], 1):
+            if self.missed is not None and self.missed[index]:
+                continue
             x, y = int(round(x)), int(round(y))
             patch = hsv[max(0, y-4):min(height, y+5), max(0, x-4):min(width, x+5)]
             pixels = patch[(patch[..., 1] >= 55) & (patch[..., 2] >= 20)]
@@ -382,10 +419,22 @@ class BendingOverlay:
         return updated.copy(), "10/10" if not held else f"{len(used)}/10 visible; {held} held"
 
     def _stable_indexed(self, detected):
+        detected = list(detected)
         if all(point is not None for point in detected) and not self._plausible_chain(
                 detected, self.last_good_points):
-            self.last_points = self.missed = None
-            return None, "marker assignments conflicted; reacquiring markers"
+            reference = self.last_good_points if self.last_good_points is not None else self.last_points
+            candidate = np.asarray(detected, float)
+            shift = np.median(candidate-reference, axis=0)
+            errors = np.linalg.norm(candidate-reference-shift, axis=1)
+            gaps = np.linalg.norm(np.diff(candidate, axis=0), axis=1)
+            reference_gaps = np.linalg.norm(np.diff(reference, axis=0), axis=1)
+            conflicts = np.flatnonzero(gaps < .45*reference_gaps)
+            if len(conflicts):
+                pair = int(conflicts[np.argmin(gaps[conflicts])])
+                rejected = pair + int(errors[pair+1] >= errors[pair])
+            else:
+                rejected = int(np.argmax(errors))
+            detected[rejected] = None
         updated = self.last_points.copy()
         visible = 0
         for index, point in enumerate(detected):
@@ -395,16 +444,17 @@ class BendingOverlay:
                 visible += 1
             else:
                 self.missed[index] += 1
-        if np.any(self.missed > 5):
-            self.last_points = self.missed = None
-            return None, "tracking lost; reacquiring markers"
         if visible == MARKER_COUNT and not self._plausible_chain(
                 updated, self.last_good_points):
-            self.last_points = self.missed = None
-            return None, "marker assignments conflicted; reacquiring markers"
+            reference = self.last_good_points if self.last_good_points is not None else self.last_points
+            rejected = int(np.argmax(np.linalg.norm(updated-reference, axis=1)))
+            updated[rejected] = self.last_points[rejected]
+            self.missed[rejected] += 1
+            visible -= 1
         self.last_points = updated
         if visible == MARKER_COUNT:
             self.last_good_points = updated.copy()
+            self.recovery_ticks = 0
         return updated.copy(), ("10/10" if visible == 10 else
                                 f"{visible}/10 visible; {10-visible} held")
 
@@ -416,6 +466,7 @@ class BendingOverlay:
             self.settings = load_settings(image.shape, self.config_path)
             self.last_points = self.last_good_points = self.missed = None
             self.hue_offset = 0
+            self.recovery_ticks = 0
             if self.settings is not None and self.settings.get("reference_points") is not None:
                 self.last_points = np.asarray(self.settings["reference_points"], float)
                 self.last_good_points = self.last_points.copy()
@@ -430,6 +481,13 @@ class BendingOverlay:
             points, status = self._stable_indexed(detected)
             if points is None:
                 points, status = self._recover(frame)
+            elif self.missed is not None and np.any(self.missed >= 5):
+                self.recovery_ticks += 1
+                if self.recovery_ticks >= 3:
+                    self.recovery_ticks = 0
+                    recovered, recovery_status = self._recover(frame)
+                    if recovered is not None:
+                        points, status = recovered, recovery_status
         else:
             points, status = self._recover(frame)
             detection_status = status
@@ -461,12 +519,19 @@ class BendingOverlay:
             )
             two_d = ("2D " + (" | ".join(f"B{i} {angle:+.1f} deg" for i, (_, _, angle)
                                         in enumerate(sections_2d, 1)) if sections_2d else "straight"))
-        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 0, 0), 6)
-        cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 255, 255), 3)
+        visible_chain = [True] + ([self.missed[index] == 0 for index in range(MARKER_COUNT-1, -1, -1)]
+                                  if self.missed is not None else [True]*MARKER_COUNT)
+        for index in range(len(ordered)-1):
+            if visible_chain[index] and visible_chain[index+1]:
+                start = tuple(np.rint(ordered[index]).astype(int))
+                end = tuple(np.rint(ordered[index+1]).astype(int))
+                cv2.line(image, start, end, (0, 0, 0), 6)
+                cv2.line(image, start, end, (0, 255, 255), 3)
         cv2.circle(image, tuple(map(int, base)), 12, (0, 0, 255), 3)
         for index, point in enumerate(ordered[1:], 1):
             center = tuple(map(int, point))
-            color = (0, 255, 0) if index == MARKER_COUNT else (255, 100, 0)
+            color = ((140, 140, 140) if not visible_chain[index] else
+                     (0, 255, 0) if index == MARKER_COUNT else (255, 100, 0))
             cv2.circle(image, center, 13, (0, 0, 0), 6)
             cv2.circle(image, center, 13, color, 4)
             cv2.putText(image, "T" if index == MARKER_COUNT else f"B{MARKER_COUNT-index}",
