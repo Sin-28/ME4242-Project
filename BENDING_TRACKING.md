@@ -39,9 +39,10 @@ Press `m` to reopen setup, `v` to toggle the overlay, and `q` or Esc to quit.
 The preview does not start the motors. If tracking loses the chain, the saved
 reference rings remain visible so that the expected and observed locations can
 be compared. Marker identities follow the manually clicked order. The tip and
-connection line update with tracked positions, and signed 2D bends over 5°
-are labeled on the image. Angle labels pause while any marker is held after a
-missed detection; recalibrate if the reference rings no longer match the rod.
+connection line update with tracked positions, and the two largest signed 2D
+bends over 5° are labeled on the image. Angle labels pause while any marker is
+held after a missed detection; recalibrate if the reference rings no longer
+match the rod.
 
 The overlay can also be enabled for existing commands, for example:
 

@@ -373,7 +373,11 @@ class BendingOverlay:
             except ValueError as exc:
                 self._text(image, "Bending: " + str(exc), 0)
                 return image
-            sections_2d = bend_sections(ordered, min_bend=5.0)
+            sections_2d = sorted(
+                sorted(bend_sections(ordered, min_bend=5.0),
+                       key=lambda section: abs(section[2]), reverse=True)[:2],
+                key=lambda section: section[0],
+            )
             two_d = ("2D " + (" | ".join(f"B{i} {angle:+.1f} deg" for i, (_, _, angle)
                                         in enumerate(sections_2d, 1)) if sections_2d else "straight"))
         cv2.polylines(image, [np.rint(ordered).astype(np.int32)], False, (0, 0, 0), 6)

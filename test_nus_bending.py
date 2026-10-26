@@ -88,6 +88,27 @@ class BendingTests(unittest.TestCase):
         self.assertTrue(any(label.endswith(" deg") and label.startswith(("+", "-"))
                             for label in labels))
 
+    def test_live_overlay_shows_only_two_largest_angle_sections(self):
+        frame, settings = self.frame_and_settings()
+        settings["reference_points"], _ = marker_chain(frame, settings)
+        labels = []
+        real_put_text = cv2.putText
+        def capture_text(image, label, *args, **kwargs):
+            labels.append(label)
+            return real_put_text(image, label, *args, **kwargs)
+        sections = [(1, 2, 12.0), (3, 4, -30.0), (6, 7, 18.0)]
+        with patch("nus_bending.load_settings", return_value=settings), \
+             patch("nus_bending.bend_sections", return_value=sections), \
+             patch("nus_bending.cv2.putText", side_effect=capture_text):
+            BendingOverlay(True).draw(frame.copy(), frame, None, None)
+        angle_labels = {label for label in labels if label.endswith(" deg")
+                        and label.startswith(("+", "-"))}
+        self.assertEqual(angle_labels, {"-30.0 deg", "+18.0 deg"})
+        summary = next(label for label in labels if label.startswith("Bending:"))
+        self.assertIn("-30.0 deg", summary)
+        self.assertIn("+18.0 deg", summary)
+        self.assertNotIn("12.0 deg", summary)
+
     def test_camera_requests_saved_frame_size_before_reading(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/"bending.json"
