@@ -1,5 +1,5 @@
 """
-Camera window shared by the nus_main commands: live overlay (letters, tip, obstacles, planned
+Camera window shared by the main commands: live overlay (letters, tip, obstacles, planned
 routes, marks), an optional MP4 recorder, and helpers.
 """
 
@@ -9,8 +9,8 @@ import time
 import cv2
 import numpy as np
 
-from nus_path import footprint
-from nus_vision import LETTERS, Vision, draw_overlay
+from path_planning import footprint
+from vision import LETTERS, Vision, draw_overlay
 
 WINDOW = "NUS retrieval  (q / Esc = stop)"
 

@@ -5,14 +5,14 @@ and pixel -> robot coordinates.
 Robot frame (from emioapi's camera calibration): millimetres, y is vertical (up),
 x and z are horizontal. The bare EMIO platform is at y = -303 mm.
 
-Settings live in nus_config.json (created with defaults on first run).
-Taught letter shapes live in letter_templates.npz (created by `nus_main.py detect`).
+Settings live in config.json (created with defaults on first run).
+Taught letter shapes live in letter_templates.npz (created by `main.py detect`).
 
-Two letter modes (`letter_mode` in nus_config.json):
+Two letter modes (`letter_mode` in config.json):
   - "color" (default): each letter has its own colour (N red, U black, S blue). Each colour is
     segmented separately, and every blob is shape-checked against that letter's template so
     same-coloured things (the blue arm disks, black cables) are rejected. Learn the colours on
-    site: `nus_main.py detect`, click a letter, press n / u / s.
+    site: `main.py detect`, click a letter, press n / u / s.
   - "shape": letters of one colour, found as blobs that differ from `background_hsv` and
     told apart by shape (e.g. white letters on black cloth: background [[[0, 0, 0], [180, 255, 100]]]).
 `background_hsv` is also the surface `check` measures the height of (default: white platform).
@@ -28,10 +28,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from nus_path import convex_hull
+from path_planning import convex_hull
 
 HERE = Path(__file__).resolve().parent
-CONFIG_PATH = HERE / "nus_config.json"
+CONFIG_PATH = HERE / "config.json"
 TEMPLATE_PATH = HERE / "letter_templates.npz"               # shape mode (letters taught on the black cloth)
 COLOR_TEMPLATE_PATH = HERE / "letter_templates_color.npz"   # colour mode (cleaner outlines, kept separate)
 LETTERS = ("N", "U", "S")
@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
     "color_max_spread_mm": 7.0,      # colour mode: a letter is flat; a blob spanning more heights is an object's side
     "letter_thickness_mm": 5.0,
     "tip_length_mm": 8.0,            # the magnet tip sticks out this far past the green marker the camera tracks
-    "holder_slots": {},              # robot (x, y, z) of each letter's slot in the holder: `python nus_main.py holder`
+    "holder_slots": {},              # robot (x, y, z) of each letter's slot in the holder: `python main.py holder`
     "holder_outlines": {},           # each letter's outline as it sits in its slot (x-z, around its magnet)
     "obstacle_height_mm": 8.0,       # anything (any colour) standing this high above the work surface is an
                                      #   obstacle: depth camera, above the letters' thickness + depth noise
@@ -97,7 +97,7 @@ def load_config():
 
 
 def save_config_value(key, value):
-    """Change one setting in nus_config.json, keeping the others as they are."""
+    """Change one setting in config.json, keeping the others as they are."""
     values = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else copy.deepcopy(DEFAULT_CONFIG)
     values[key] = value
     _write_config(values)
@@ -843,7 +843,7 @@ class Vision:
         return max(holes, key=lambda h: h[0])[1] if holes else None
 
     def learn_color(self, letter, frame, x, y, tolerance=30, window=60):
-        """Learn a letter's colour from the paint at (x, y) and save it to nus_config.json.
+        """Learn a letter's colour from the paint at (x, y) and save it to config.json.
         Flood-fills the connected pixels of similar colour (like a paint bucket), so only the
         letter's own paint is used, not the platform around it. Returns the ranges, or None."""
         h, w = frame.shape[:2]

@@ -2,25 +2,25 @@
 N-U-S letter retrieval: find the letters with the camera and steer the manipulator tip over them.
 
 Run inside the ME4242 conda env, with EMIO Labs closed:
-    python nus_main.py check --apply       # camera only: check a (new) set, save its surface height
-    python nus_main.py detect              # camera only: check letter detection, teach letter shapes
-    python nus_main.py jog                 # wind cables by keyboard: take up slack, find pull directions
-    python nus_main.py calibrate           # find each cable's pull direction + taut point, measure the model
-    python nus_main.py calibrate --pull-signs=-1,-1,1,1   # pull directions known (e.g. from jog)
-    python nus_main.py goto N              # steer the tip over letter N  (or U, S, all)
-    python nus_main.py goto all --dry-run  # detect and plan only, motors never move
-    python nus_main.py search              # N -> U -> S in turn, timed, results saved to runs/
-    python nus_main.py search --trials 5 --record   # 5 trials, saves a video of each session
-    python nus_main.py explore             # map where the tip really goes, obstacles in place (after calibrate)
-    python nus_main.py holder              # camera only: teach the holder's N, U, S slots
-    python nus_main.py retrieve --dry-run  # camera only: show the planned routes
-    python nus_main.py retrieve            # pick the letters up, trial and error, into the holder (nus_retrieve.py)
+    python main.py check --apply       # camera only: check a (new) set, save its surface height
+    python main.py detect              # camera only: check letter detection, teach letter shapes
+    python main.py jog                 # wind cables by keyboard: take up slack, find pull directions
+    python main.py calibrate           # find each cable's pull direction + taut point, measure the model
+    python main.py calibrate --pull-signs=-1,-1,1,1   # pull directions known (e.g. from jog)
+    python main.py goto N              # steer the tip over letter N  (or U, S, all)
+    python main.py goto all --dry-run  # detect and plan only, motors never move
+    python main.py search              # N -> U -> S in turn, timed, results saved to runs/
+    python main.py search --trials 5 --record   # 5 trials, saves a video of each session
+    python main.py explore             # map where the tip really goes, obstacles in place (after calibrate)
+    python main.py holder              # camera only: teach the holder's N, U, S slots
+    python main.py retrieve --dry-run  # camera only: show the planned routes
+    python main.py retrieve            # pick the letters up, trial and error, into the holder (pick_and_place.py)
 
 Press q or Esc in the camera window at any time to stop. Stopping (or finishing)
 disables motor torque, so the arm goes slack.
 
 Steps 1-3 of the task (find letter, raise the tip, move over it, lower onto it) are covered here.
-Picking the letters up and placing them in the holder: `retrieve` (nus_retrieve.py).
+Picking the letters up and placing them in the holder: `retrieve` (pick_and_place.py).
 """
 
 import argparse
@@ -34,12 +34,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from nus_control import (MAX_TRAVEL_RAD, PULL_MAX_MM, PULLEY_RADIUS_MM, Cables, align_to_calibration, calibrate,
+from cable_control import (MAX_TRAVEL_RAD, PULL_MAX_MM, PULLEY_RADIUS_MM, Cables, align_to_calibration, calibrate,
                          describe_model, load_calibration, lower_onto, move_tip_adaptive, move_tip_along, move_tip_to,
                          probe_model, raise_tip, reachability, reset_live_model, set_live_model, solve_pulls)
-from nus_path import densify, min_clearance, path_length, plan_path, touched
-from nus_ui import WINDOW, Display, Recorder, locate_letters, open_camera_or_exit, stable_objects
-from nus_vision import LETTERS, Vision, fmt, load_config, save_config_value
+from path_planning import densify, min_clearance, path_length, plan_path, touched
+from display import WINDOW, Display, Recorder, locate_letters, open_camera_or_exit, stable_objects
+from vision import LETTERS, Vision, fmt, load_config, save_config_value
 
 # ---------------------------------------------------------------- detect
 
@@ -51,7 +51,7 @@ def teach_color_and_shape(vision, letter, frame, depth, click, replace=False):
     if ranges is None:
         print(f"  Couldn't learn {letter}'s colour: click ON the letter's paint (a stroke, not a gap).")
         return
-    print(f"Learned {letter}'s colour: HSV ranges {ranges} (saved to nus_config.json)")
+    print(f"Learned {letter}'s colour: HSV ranges {ranges} (saved to config.json)")
     _, candidates = vision.detect_letters(frame, depth)
     same_colour = [d for d in candidates if d.get("color_of") == letter]
     # nearest blob of that colour (signed distance: > 0 inside, < 0 outside), so a click in a gap works too
@@ -184,9 +184,9 @@ def cmd_check(cfg, args):
                 save_config_value("stage_y_mm", float(suggested))
                 cfg["stage_y_mm"] = float(suggested)
                 vision._roi = None                           # search circle depends on this height
-                print(f"              -> saved to nus_config.json")
+                print(f"              -> saved to config.json")
             elif abs(suggested - cfg["stage_y_mm"]) > 5:
-                print("              -> run `python nus_main.py check --apply` to save it")
+                print("              -> run `python main.py check --apply` to save it")
 
         found = locate_letters(vision, display)
         for L in LETTERS:
@@ -372,7 +372,7 @@ def plan_route(vision, start_xz, target, letter, obstacles, reachable, args):
 def cmd_search(cfg, args):
     calib = load_calibration()
     if calib is None:
-        sys.exit("No cable_calibration.json yet: run `python nus_main.py calibrate` first.")
+        sys.exit("No cable_calibration.json yet: run `python main.py calibrate` first.")
     camera = open_camera_or_exit()
     vision = Vision(cfg, camera)
     recorder = Recorder(RUNS_DIR / f"search_{time.strftime('%Y%m%d_%H%M%S')}.mp4") if args.record else None
@@ -530,7 +530,7 @@ def cmd_search(cfg, args):
 
 def cmd_jog(cfg, args):
     if args.teach:
-        from nus_retrieve import cmd_teach
+        from pick_and_place import cmd_teach
         return cmd_teach(cfg, args)
     print("Wind each cable by keyboard to take up slack or to find which direction pulls.\n"
           "In the camera window: 0-3 select a motor | w / s = +1 / -1 mm | W / S = +5 / -5 mm | q quit.\n"
@@ -581,7 +581,7 @@ def cmd_jog(cfg, args):
 def cmd_goto(cfg, args):
     calib = load_calibration()
     if calib is None:
-        sys.exit("No cable_calibration.json yet: run `python nus_main.py calibrate` first.")
+        sys.exit("No cable_calibration.json yet: run `python main.py calibrate` first.")
     print(f"Using calibration from {calib['created']} (recalibrate if the cables were re-wound).")
 
     camera = open_camera_or_exit()
@@ -644,7 +644,7 @@ def main():
     parser = argparse.ArgumentParser(description="N-U-S letter retrieval with the EMIO cable manipulator")
     sub = parser.add_subparsers(dest="command", required=True)
     p_chk = sub.add_parser("check", help="camera only: check a (new) set, measure the surface height")
-    p_chk.add_argument("--apply", action="store_true", help="save the measured stage height to nus_config.json")
+    p_chk.add_argument("--apply", action="store_true", help="save the measured stage height to config.json")
     p_chk.add_argument("--letter-mm", type=float, default=5.0, help="letter thickness in mm (default 5)")
     sub.add_parser("detect", help="camera only: show detections, teach letter shapes")
     p_jog = sub.add_parser("jog", help="wind cables by keyboard: take up slack, find pull directions")
@@ -721,7 +721,7 @@ def main():
     p_r.add_argument("--hug-mm", type=float, default=8.0, help="gap kept from objects with --route contact (default 8)")
     p_r.add_argument("--clearance-mm", type=float, default=15.0, help="gap kept from the other letters (default 15)")
     p_r.add_argument("--tip-mm", type=float, default=None,
-                     help="how far the magnet tip sticks out past the green marker (default: tip_length_mm in nus_config.json, 8)")
+                     help="how far the magnet tip sticks out past the green marker (default: tip_length_mm in config.json, 8)")
     p_r.add_argument("--directions", type=int, default=8, help="approach sides tried per letter (default 8)")
     p_r.add_argument("--stuck-s", type=float, default=3.0, help="tip hasn't moved for this long = stuck (default 3 s)")
     p_r.add_argument("--stuck-mm", type=float, default=4.0, help="...moved less than this (default 4 mm)")
@@ -749,7 +749,7 @@ def main():
         parser.error(f"--pull-max-mm must be between 1 and {MAX_TRAVEL_RAD * PULLEY_RADIUS_MM - 10:.0f} mm of cable")
 
     cfg = load_config()
-    from nus_retrieve import cmd_explore, cmd_holder, cmd_retrieve
+    from pick_and_place import cmd_explore, cmd_holder, cmd_retrieve
     commands = {"check": cmd_check, "detect": cmd_detect, "jog": cmd_jog, "calibrate": cmd_calibrate,
                 "goto": cmd_goto, "search": cmd_search, "holder": cmd_holder, "retrieve": cmd_retrieve,
                 "explore": cmd_explore}

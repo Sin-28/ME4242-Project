@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from nus_vision import fmt
+from vision import fmt
 
 HERE = Path(__file__).resolve().parent
 CALIB_PATH = HERE / "cable_calibration.json"
@@ -193,7 +193,7 @@ def align_to_calibration(cables, log=print):
         f"M{j} {drift[j] * PULLEY_RADIUS_MM:+.1f} mm" if used[j] else f"M{j} unused" for j in range(4)))
     if np.any(np.abs(drift) > MAX_DRIFT_RAD):
         raise RuntimeError("A cable spool has moved since calibration (more than "
-                           f"{MAX_DRIFT_RAD * PULLEY_RADIUS_MM:.0f} mm). Run `python nus_main.py calibrate` again.")
+                           f"{MAX_DRIFT_RAD * PULLEY_RADIUS_MM:.0f} mm). Run `python main.py calibrate` again.")
     cables.calib = {**cables.calib, "taut_angle": taut.tolist()}
 
 
@@ -267,7 +267,7 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
             if any(t["k"] is not None for t in trials):
                 log(f"Motor {j}: the tip shifted but didn't keep moving in any direction tried (only let out?)")
             log(f"Motor {j}: UNUSED - no direction kept moving the tip. Either no cable is attached to it, or "
-                f"its cable has more slack than {search_mm:.0f} mm (wind it in with `python nus_main.py jog`, "
+                f"its cable has more slack than {search_mm:.0f} mm (wind it in with `python main.py jog`, "
                 "then calibrate again).")
             continue
         currents = [t["current_rise"] for t in good]
@@ -353,7 +353,7 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
             if abs((angle[a] - angle[b] + 180.0) % 360.0 - 180.0) < 40.0:
                 log(f"WARNING: motors {a} and {b} both pull the tip toward about {angle[a]:.0f} deg, and no cable "
                     f"pulls toward the other side ({max(gaps):.0f} deg gap): one of them is probably turning the "
-                    "wrong way (letting its cable out). Check with `python nus_main.py jog` which way tightens "
+                    "wrong way (letting its cable out). Check with `python main.py jog` which way tightens "
                     "each cable, then calibrate with --pull-signs.")
     for a, b in combinations(used, 2):       # two cables that look identical = a measurement went wrong
         if np.linalg.norm(J[:, a] - J[:, b]) < 0.05 * max(np.linalg.norm(J[:, a]), 1e-6) + 1e-3:

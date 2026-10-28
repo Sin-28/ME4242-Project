@@ -4,7 +4,7 @@ obstacles in place.
 
 The calibration's linear model (tip = tip_taut + J p) only holds near the rest pose: the real arm
 bends nonlinearly, a tip on the platform sticks and slips, and around the obstacles it leans on
-them or gets caught. So, once per calibration (`python nus_main.py explore`, obstacles and holder
+them or gets caught. So, once per calibration (`python main.py explore`, obstacles and holder
 in place, letters removed: the magnet would pick them up), every pair of neighbouring cables is
 stepped through a grid of pulls, as far as the arm goes, and the tip's position is recorded.
 
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-from nus_path import convex_hull, densify, inside
+from path_planning import convex_hull, densify, inside
 
 HERE = Path(__file__).resolve().parent
 MAP_PATH = HERE / "workspace_map.json"
@@ -61,7 +61,7 @@ def explore(cables, vision, on_frame, pull_max_mm, step_mm=5.0, max_load_ma=1500
     of these motors and keep the rest of the saved map (same calibration). push: motors whose rows
     don't stop when the tip stops moving (pressed on an obstacle: pulling harder gets it past),
     only on the current / lag / pull limits. Saves and returns the map."""
-    from nus_control import _cable_load
+    from cable_control import _cable_load
     pairs = neighbour_pairs(cables.calib)
     if not pairs:
         raise RuntimeError("Need at least 2 working cables in the calibration to explore.")
@@ -203,8 +203,8 @@ def check_cables(cables, vision, on_frame, rest, levels_mm=(5.0, 10.0, 15.0, 20.
         raise RuntimeError(
             f"Cable(s) {', '.join(f'M{j}' for j in bad)} stop moving the tip when pulled further: their direction "
             "in the calibration is probably wrong (the motor lets the cable out), or the cable is slack / off its "
-            "spool. Check with `python nus_main.py jog` which way tightens each cable, then "
-            "`python nus_main.py calibrate --pull-signs=...` and explore again.")
+            "spool. Check with `python main.py jog` which way tightens each cable, then "
+            "`python main.py calibrate --pull-signs=...` and explore again.")
 
 
 def load_map(calib=None, pull_limit=None, log=print):
@@ -215,7 +215,7 @@ def load_map(calib=None, pull_limit=None, log=print):
     data = json.loads(MAP_PATH.read_text())
     if calib is not None and data.get("calibration") != calib.get("created"):
         log(f"{MAP_PATH.name} was made with another calibration ({data.get('calibration')}): "
-            "run `python nus_main.py explore` again. Not using it.")
+            "run `python main.py explore` again. Not using it.")
         return None
     return WorkspaceMap(data, pull_limit)
 

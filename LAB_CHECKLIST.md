@@ -6,15 +6,15 @@ In any camera window, **q / Esc stops** and switches the motors off (Ctrl+C in t
 ## Test-run order (obstacles + holder)
 | # | Command | Motors? | Check before going on |
 |---|---|---|---|
-| 1 | `python nus_main.py check --apply` | no | Tip found; surface height saved |
-| 2 | `python nus_main.py calibrate --pull-signs=1,1,1,1` (all +1 on this set, Oct 20 and Oct 26) | yes | 4 cables pulling in **4 different directions all round** (~90 deg apart); no WARNING about two motors pulling the same way or "measured exactly the same". Without --pull-signs it tries both ways per motor |
-| 2b | `python nus_main.py explore` (**obstacles + holder in place, letters OFF**) | yes | First pulls each cable alone 10 then 20 mm and stops if one doesn't keep moving the tip (= backwards in the calibration). Then a few minutes; prints how far the tip reaches. Re-run after every calibrate or when an obstacle moves. **The green outline must cover the holder's slots**: if not, `explore --only M1` (the cable(s) pulling toward the holder) adds that side to the map |
-| 3 | `python nus_main.py detect` | no | N, U, S green (teach with click + n/u/s if not); one orange outline per obstacle/block, none on the arm, letters or bare platform |
-| 4a | `python nus_main.py jog --teach` (holder in place, one letter on the magnet at a time) | yes | Drive the letter into its slot with the keys, `a` for poses on the way, Enter + n/u/s saves; `p` + letter replays it from the middle to check. `retrieve` then puts that letter in by replaying it (no tip tracking on the holder) |
-| 4 | `python nus_main.py holder` (**each letter sitting in its slot**) | no | Click each letter in its slot + n/u/s ("from the N sitting in it"), q saves; no "outside the camera's search circle" warning. Then take the letters out and lay them on the table **turned the same way as in their slots** |
-| 5 | `python nus_main.py retrieve --dry-run` | no | Every letter inside the **green outline** (where the tip was seen to reach) with a cyan route round the obstacles; "OUT OF REACH" = move that letter in. No "lies turned ... WARNING" (turn that letter on the table) |
-| 6 | `python nus_main.py retrieve --no-place --record` | yes | Reaches each magnet; when caught it gives up after 3 s, goes back to the middle, tries another side |
-| 7 | `python nus_main.py retrieve --record` | yes | Grab -> carry -> slot; read `runs/retrieve_log.csv` afterwards |
+| 1 | `python main.py check --apply` | no | Tip found; surface height saved |
+| 2 | `python main.py calibrate --pull-signs=1,1,1,1` (all +1 on this set, Oct 20 and Oct 26) | yes | 4 cables pulling in **4 different directions all round** (~90 deg apart); no WARNING about two motors pulling the same way or "measured exactly the same". Without --pull-signs it tries both ways per motor |
+| 2b | `python main.py explore` (**obstacles + holder in place, letters OFF**) | yes | First pulls each cable alone 10 then 20 mm and stops if one doesn't keep moving the tip (= backwards in the calibration). Then a few minutes; prints how far the tip reaches. Re-run after every calibrate or when an obstacle moves. **The green outline must cover the holder's slots**: if not, `explore --only M1` (the cable(s) pulling toward the holder) adds that side to the map |
+| 3 | `python main.py detect` | no | N, U, S green (teach with click + n/u/s if not); one orange outline per obstacle/block, none on the arm, letters or bare platform |
+| 4a | `python main.py jog --teach` (holder in place, one letter on the magnet at a time) | yes | Drive the letter into its slot with the keys, `a` for poses on the way, Enter + n/u/s saves; `p` + letter replays it from the middle to check. `retrieve` then puts that letter in by replaying it (no tip tracking on the holder) |
+| 4 | `python main.py holder` (**each letter sitting in its slot**) | no | Click each letter in its slot + n/u/s ("from the N sitting in it"), q saves; no "outside the camera's search circle" warning. Then take the letters out and lay them on the table **turned the same way as in their slots** |
+| 5 | `python main.py retrieve --dry-run` | no | Every letter inside the **green outline** (where the tip was seen to reach) with a cyan route round the obstacles; "OUT OF REACH" = move that letter in. No "lies turned ... WARNING" (turn that letter on the table) |
+| 6 | `python main.py retrieve --no-place --record` | yes | Reaches each magnet; when caught it gives up after 3 s, goes back to the middle, tries another side |
+| 7 | `python main.py retrieve --record` | yes | Grab -> carry -> slot; read `runs/retrieve_log.csv` afterwards |
 
 Why `explore`: the calibration's straight-line model only holds near the rest pose; the real arm
 bends nonlinearly, a tip resting on the platform sticks and slips, and around the obstacles it leans
@@ -44,7 +44,7 @@ from any side, the log says so (`No route left` / `stuck`): lower it or move the
 
 ## 0b. Check the set (every new set / new day, 1 min, motors don't move)
 ```
-python nus_main.py check --apply
+python main.py check --apply
 ```
 Saves this set's surface height (`stage_y_mm`). Read the "Tip" line:
 - **OK / a bit off-centre**: carry on.
@@ -55,7 +55,7 @@ Saves this set's surface height (`stage_y_mm`). Read the "Tip" line:
 
 ## 1. Cables taut (only if calibration complains about slack)
 ```
-python nus_main.py jog
+python main.py jog
 ```
 `0`-`3` select motor, `w`/`s` = +1/-1 mm, `W`/`S` = +5/-5 mm. Wind each cable until the
 "tip moved" readout starts to rise (~5 px). **Write down which key tightened each motor**
@@ -63,9 +63,9 @@ python nus_main.py jog
 
 ## 2. Calibrate (every session and every set, ~2 min)
 ```
-python nus_main.py calibrate --pull-signs=M0,M1,M2,M3      e.g. --pull-signs=-1,-1,1,1
+python main.py calibrate --pull-signs=M0,M1,M2,M3      e.g. --pull-signs=-1,-1,1,1
 ```
-(or plain `python nus_main.py calibrate` if you don't know the directions yet; on a
+(or plain `python main.py calibrate` if you don't know the directions yet; on a
 **different set** the directions can differ, so don't reuse another set's signs).
 Good result: 4 lines "Motor j: pulls with direction ...", and the four "direction ... deg"
 values roughly 90 deg apart, each moving the tip > 0.2 mm per mm of cable.
@@ -76,11 +76,11 @@ cables are taut, nudge the tip free, calibrate again. "the tip didn't come back 
 
 ## 3. Check the letters (camera only)
 ```
-python nus_main.py detect
+python main.py detect
 ```
 **Coloured letters (default, `letter_mode: "color"`): N red, U black, S blue, on the white platform.**
 Teach each letter once per lighting setup: **click ON its paint (a stroke, not a gap) and press
-n / u / s**. That learns its colour (saved in `nus_config.json`) and stores its shape
+n / u / s**. That learns its colour (saved in `config.json`) and stores its shape
 (`letter_templates_color.npz`). Do 2 examples per letter at different spots/angles.
 All three should then be green, inside the grey circle, 1-2 cm apart, clear of the arm.
 A red label like `S? 1.00` = right colour but rejected; the console/overlay reason says why
@@ -99,8 +99,8 @@ letters, shadows and marks on the platform should have none.
 
 ## 4. Search N -> U -> S
 ```
-python nus_main.py search --pull-max-mm 25                       one run
-python nus_main.py search --pull-max-mm 25 --trials 5 --record   5 runs + video for the report
+python main.py search --pull-max-mm 25                       one run
+python main.py search --pull-max-mm 25 --trials 5 --record   5 runs + video for the report
 ```
 For each letter: **0. measure the cables** where the arm is now: each cable is pulled 3 mm and
 let back (the tip wiggles a little), printed as `cables here: M0 3.4 mm/mm at +88 deg, +0.7 up | ...`.
@@ -135,10 +135,10 @@ raised_mm and above_letter_mm = tip height above the letter at the end) and `run
 Teach the holder once per set-up (camera only): put the holder in place **with each letter
 sitting in its slot**, then
 ```
-python nus_main.py holder
+python main.py holder
 ```
 click each letter and press n / u / s; q saves. That learns where its magnet sits in the slot and
-which way the letter faces there (`holder_outlines` in nus_config.json). (Clicking the middle of an
+which way the letter faces there (`holder_outlines` in config.json). (Clicking the middle of an
 empty slot still works, but then the orientation can't be checked.)
 **The arm can't turn a letter** (it has no wrist and the magnet holds the letter as it was lying),
 so lay each letter on the table turned the way it sits in its slot. `retrieve` measures it: "N lies
@@ -146,14 +146,14 @@ turned -39 deg from its slot - WARNING" means turn N by about that much (more th
 20 won't go in). N and S look the same turned half round, so the smaller turn is given.
 Check the plan without moving (camera only), then run it:
 ```
-python nus_main.py retrieve --dry-run                one look at the plan (30 s, then it stops)
-python nus_main.py retrieve --record                 the real thing, with a video in runs/
-python nus_main.py retrieve --no-place               holder not ready: only reach each magnet
+python main.py retrieve --dry-run                one look at the plan (30 s, then it stops)
+python main.py retrieve --record                 the real thing, with a video in runs/
+python main.py retrieve --no-place               holder not ready: only reach each magnet
 ```
 What it does, until all three letters are in their slots (q in the window or Ctrl+C stops it):
 1. scans the letters (their magnets) and the obstacles;
 2. plans, for every letter, one route per side of the block it lies on (8 sides): around the
-   obstacles (grown by the magnet tip's length, `tip_length_mm` = 8 in nus_config.json, or
+   obstacles (grown by the magnet tip's length, `tip_length_mm` = 8 in config.json, or
    `--tip-mm`) to just outside that side, then straight in. Sides away from the middle are
    preferred (the tip is higher there). Cyan = route it takes, grey = the alternatives,
    coloured dots = approach points. The cheapest letter goes first;
@@ -188,7 +188,7 @@ Every attempt is logged in `runs/retrieve_log.csv` (letter, side, stage, result,
 | Motor j did not follow its commands | Motor power / wiring |
 | The tip is far off-centre | Arm not hanging freely, or something green near the robot |
 | Letter "not found" / OUT OF REACH | Move it closer to the centre (inside the circle), teach it (step 3) |
-| Letters detected in the wrong place | `stage_y_mm` in `nus_config.json` must match the surface height (-290 bare platform, about -228 raised) |
+| Letters detected in the wrong place | `stage_y_mm` in `config.json` must match the surface height (-290 bare platform, about -228 raised) |
 | `retrieve`: "No route left to try" | Every side failed twice: move the letter or the obstacle, or try `--route avoid` |
 | `retrieve`: tip keeps getting caught on a block's edge | Raise `--tip-mm` (more clearance), or lower that block |
 | `retrieve`: "letter didn't come along" | The magnet didn't take it: check the tip's magnet; `--success-mm 5` lines up closer. "... mm above touching" = too low for the arm there: move the letter in or onto a higher block |

@@ -1,10 +1,10 @@
 """
 Retrieve the N, U, S letters into their holder, by trial and error with path planning.
 
-    python nus_main.py holder               # camera only, once per set-up: click each holder slot, press n / u / s
-    python nus_main.py retrieve --dry-run   # camera only: letters, obstacles and the planned routes
-    python nus_main.py retrieve             # pick the letters up one by one and put them in the holder
-    python nus_main.py retrieve --no-place  # only reach each magnet (no holder yet)
+    python main.py holder               # camera only, once per set-up: click each holder slot, press n / u / s
+    python main.py retrieve --dry-run   # camera only: letters, obstacles and the planned routes
+    python main.py retrieve             # pick the letters up one by one and put them in the holder
+    python main.py retrieve --no-place  # only reach each magnet (no holder yet)
 
 Until all three letters are in their slots (or Ctrl+C / q in the camera window):
  1. Scan: the letters (pick point = magnet) and the obstacles, over a few frames.
@@ -31,14 +31,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from nus_control import (Cables, Watchdog, _cable_load, align_to_calibration, describe_model, load_calibration, lower_onto,
+from cable_control import (Cables, Watchdog, _cable_load, align_to_calibration, describe_model, load_calibration, lower_onto,
                          move_tip_adaptive, move_tip_along, probe_model, reachability, reset_live_model,
                          set_live_model)
-from nus_map import follow, load_map, play
-from nus_path import (approach_routes, convex_hull, densify, footprint, path_length, plan_path, polygons_overlap,
+from workspace_map import follow, load_map, play
+from path_planning import (approach_routes, convex_hull, densify, footprint, path_length, plan_path, polygons_overlap,
                       relative_yaw, support_of)
-from nus_ui import WINDOW, Display, Recorder, open_camera_or_exit, stable_objects
-from nus_vision import LETTERS, Vision, fmt, save_config_value
+from display import WINDOW, Display, Recorder, open_camera_or_exit, stable_objects
+from vision import LETTERS, Vision, fmt, save_config_value
 
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 LOG_FIELDS = ["time", "letter", "attempt", "stage", "side_deg", "cost", "result", "reason", "seconds",
@@ -104,7 +104,7 @@ def plan(ctx, start_xz, goal_xyz, letters, objects, skip=(), failed=(), carrying
     With a workspace map: the cheapest chain of recorded pull settings to the goal (the obstacles
     were in place while exploring, so contacts are in it), keeping clear of the letters not in
     `skip`; places where earlier tries failed (`failed`: {"angle", "spot", "approach"}) are
-    avoided if possible. Without one: one route per approach side (nus_path.approach_routes),
+    avoided if possible. Without one: one route per approach side (path_planning.approach_routes),
     around every object except the one under the goal, grown by the tip's length, and the letters."""
     args, cfg = ctx["args"], ctx["cfg"]
     goal = np.asarray(goal_xyz, float)[[0, 2]]
@@ -324,12 +324,12 @@ def grabbed(ctx, L, lay_at):
 def cmd_retrieve(cfg, args):
     calib = load_calibration()
     if calib is None:
-        sys.exit("No cable_calibration.json yet: run `python nus_main.py calibrate` first.")
+        sys.exit("No cable_calibration.json yet: run `python main.py calibrate` first.")
     slots = {L: np.asarray(p, float) for L, p in (cfg.get("holder_slots") or {}).items()}
     taught = cfg.get("holder_pull_paths") or {}
     missing = sorted(set(LETTERS) - set(slots) - set(taught))
     if not args.no_place and not args.dry_run and missing:
-        sys.exit("The holder's slots aren't taught yet (" + ", ".join(missing) + " missing): run `python nus_main.py "
+        sys.exit("The holder's slots aren't taught yet (" + ", ".join(missing) + " missing): run `python main.py "
                  "jog --teach` (drive each letter in by hand) or `holder`, or `retrieve --no-place` to only reach the magnets.")
     for L, t in taught.items():
         if t.get("calibration") != calib.get("created"):
@@ -339,7 +339,7 @@ def cmd_retrieve(cfg, args):
         cfg["tip_length_mm"] = args.tip_mm
     wmap = None if args.no_map else load_map(calib, pull_limit=args.pull_max_mm)
     if wmap is None and not args.no_map:
-        print("No workspace map for this calibration: run `python nus_main.py explore` first (platform cleared) "
+        print("No workspace map for this calibration: run `python main.py explore` first (platform cleared) "
               "for much better path following and an honest reach check. Using the adaptive controller.")
     pull_max = args.pull_max_mm if args.pull_max_mm is not None else (
         float(wmap.pull_max.max()) if wmap is not None else 25.0)
@@ -380,7 +380,7 @@ def cmd_retrieve(cfg, args):
         display.shapes = [(ctx["slot_outlines"][L] + slots[L][[0, 2]], slots[L][1], COLOURS[L]) for L in ctx["slot_outlines"]]
         if slots and len(ctx["slot_outlines"]) < len(slots):
             print("Slots taught without their letters in them: orientation can't be checked. To check it, put each "
-                  "letter in its slot and teach it again with `python nus_main.py holder`.")
+                  "letter in its slot and teach it again with `python main.py holder`.")
         print(f"Tip at the middle: {fmt(rest['pos'])}. Tip length past the marker: {cfg['tip_length_mm']:.0f} mm. "
               + ("Holder slots: " + ", ".join(f"{L} {fmt(p)}" for L, p in slots.items()) if slots else "No holder slots."))
         for L, p in slots.items():
@@ -660,7 +660,7 @@ def save_log(rows):
 
 def cmd_holder(cfg, args):
     """Click on each slot of the holder in the camera window and press n / u / s: its position
-    (from the depth camera) is saved as holder_slots in nus_config.json."""
+    (from the depth camera) is saved as holder_slots in config.json."""
     camera = open_camera_or_exit()
     vision = Vision(cfg, camera)
     display = Display(vision)
@@ -721,7 +721,7 @@ def cmd_holder(cfg, args):
         cv2.destroyAllWindows()
     save_config_value("holder_slots", slots)
     save_config_value("holder_outlines", outlines)
-    print(f"Saved holder_slots ({', '.join(sorted(slots)) or 'none'}) to nus_config.json")
+    print(f"Saved holder_slots ({', '.join(sorted(slots)) or 'none'}) to config.json")
 
 
 # ---------------------------------------------------------------- teach the holder by hand
@@ -735,7 +735,7 @@ def cmd_teach(cfg, args):
     slot (Enter, then n / u / s). `retrieve` replays it to put that letter in."""
     calib = load_calibration()
     if calib is None:
-        sys.exit("No cable_calibration.json yet: run `python nus_main.py calibrate` first.")
+        sys.exit("No cable_calibration.json yet: run `python main.py calibrate` first.")
     unused = [j for j in range(4) if calib["pull_sign"][j] == 0]
     if unused:
         print(f"WARNING: {', '.join(f'M{j}' for j in unused)} UNUSED in the calibration, so it can't move here. "
@@ -746,7 +746,7 @@ def cmd_teach(cfg, args):
           "  a = keep this pose as a step on the way (e.g. above the holder's edge)   x = forget the steps\n"
           "  Enter, then n / u / s = save the steps + this pose for that slot\n"
           "  r = let all cables go (back to the middle)   p, then n / u / s = replay a saved slot from the middle\n"
-          "  q = quit (each slot is saved to nus_config.json as soon as you save it)")
+          "  q = quit (each slot is saved to config.json as soon as you save it)")
     camera = open_camera_or_exit()
     vision = Vision(cfg, camera)
     display = Display(vision)
@@ -818,22 +818,22 @@ def cmd_teach(cfg, args):
         cables.close()
         camera.close()
         cv2.destroyAllWindows()
-    print(f"Taught slots: {', '.join(sorted(paths)) or 'none'} (holder_pull_paths in nus_config.json)")
+    print(f"Taught slots: {', '.join(sorted(paths)) or 'none'} (holder_pull_paths in config.json)")
 
 
 # ---------------------------------------------------------------- map the workspace
 
 def cmd_explore(cfg, args):
-    """Map where the tip really goes for combinations of cable pulls (see nus_map.explore)."""
-    from nus_map import explore
+    """Map where the tip really goes for combinations of cable pulls (see workspace_map.explore)."""
+    from workspace_map import explore
     calib = load_calibration()
     if calib is None:
-        sys.exit("No cable_calibration.json yet: run `python nus_main.py calibrate` first.")
+        sys.exit("No cable_calibration.json yet: run `python main.py calibrate` first.")
     unused = [j for j in range(4) if calib["pull_sign"][j] == 0]
     if unused:
         sys.exit(f"The calibration has no cable for {', '.join(f'M{j}' for j in unused)} (UNUSED: the tip didn't move "
                  "while it searched), so explore couldn't reach that side of the workspace. Its cable is probably "
-                 "slack (the spools unwind while the motors are off): run `python nus_main.py calibrate "
+                 "slack (the spools unwind while the motors are off): run `python main.py calibrate "
                  "--pull-signs=1,1,1,1` again (it now searches 50 mm), then explore.")
     print(f"Explore pulls each pair of neighbouring cables through a grid (every {args.step_mm:.0f} mm) as far as "
           f"the arm goes: until the tip stops moving, a motor can't pull further, its current rises by "
