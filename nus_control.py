@@ -50,6 +50,8 @@ SEARCH_MAX_MM = 30.0           # give up on a direction after this much cable
 TAUT_SHIFT_PX = 5.0            # tip shift (pixels) that means "this cable is now pulling"
 CONFIRM_PULL_MM = 4            # ...if pulling this much further moves the tip on by TAUT_SHIFT_PX again
 JACOBIAN_PULL_MM = 5.0         # test pull used to measure each Jacobian column (halved if the tip is lost)
+PUSH_MM = 30.0                 # --push cables: pull this far to measure their model past an obstacle
+TAUT_CURRENT_MA = 60.0         # --push cables: a current rise this big also means "taut" (tip may be hidden)
 PULL_MAX_MM = 15.0             # never pull a cable more than this beyond taut (raise once you trust it)
 
 # raising the tip (raise_tip / lower_onto)
@@ -215,12 +217,16 @@ def solve_pulls(J, d, p_max):
     return best_p, best_r
 
 
-def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, search_mm=SEARCH_MAX_MM, log=print):
+def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, search_mm=SEARCH_MAX_MM,
+              push=(), push_mm=PUSH_MM, max_load_ma=1500.0, log=print):
     """Find each cable's pull direction and 'just taut' angle, then measure the Jacobian.
     Expects the arm at rest with all cables slack: hanging straight, or lying bent on a raised
     platform (the model is then measured around that bent pose, which is where it is used).
     pull_signs: known pull direction per motor (e.g. from `jog`); then only that direction is searched,
-    so no cable is ever unwound."""
+    so no cable is ever unwound. push: motors whose side is blocked by an obstacle near the rest pose
+    (needs pull_signs): such a cable counts once it is taut even if the tip then stops (pressed on
+    the obstacle), and its model is measured by pulling up to push_mm, through or over the obstacle
+    (stops early if its current rises by max_load_ma)."""
     start = cables.read_angles()
     base = vision.measure_tip(10, on_frame)
     if base is None:
@@ -243,16 +249,20 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
             log(f"Motor {j}: marked unused (--pull-signs 0)")
             continue
         directions = (pull_signs[j],) if pull_signs else (first_direction, -first_direction)
-        trials = [_try_direction(cables, vision, on_frame, start, base, j, sign, search_mm, log) for sign in directions]
+        trials = [_try_direction(cables, vision, on_frame, start, base, j, sign, search_mm, log, push=j in push)
+                  for sign in directions]
         # a PULLING cable keeps moving the tip further out (and the motor works harder); a cable being
         # LET OUT moves it a bit too (the other cables pull it over, an arm that was pressed relaxes),
         # then stops once it is slack: compare how much each direction still moves the tip 4-8 mm on
-        good = [t for t in trials if t["k"] is not None and t["growth_px"] >= TAUT_SHIFT_PX]
+        good = [t for t in trials if t["k"] is not None and (t["growth_px"] >= TAUT_SHIFT_PX or
+                                                             (j in push and pull_signs))]
         for t in trials:
             if t["k"] is not None:
                 rise = "" if t["current_rise"] is None else f", motor current {t['current_rise']:+.0f} mA"
                 log(f"Motor {j} direction {t['sign']:+d}: tip shifted after {t['k']} mm, then moved "
                     f"{t['growth_px']:.0f} px more over the next 4 mm{rise}")
+        if good and good[0]["growth_px"] < TAUT_SHIFT_PX:
+            log(f"Motor {j}: taut, then the tip stops (pressed on something): kept, since --push includes it")
         if not good:
             if any(t["k"] is not None for t in trials):
                 log(f"Motor {j}: the tip shifted but didn't keep moving in any direction tried (only let out?)")
@@ -291,7 +301,22 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
         raise RuntimeError("Lost the tip at the taut pose.")
     J = np.zeros((3, 4))                     # unused motors keep a zero column
     base = taut_tip
-    for j in used:
+    for j in sorted(used, key=lambda j: j in push):      # pushed cables last (may need the others)
+        if j in push:
+            base = vision.measure_tip(6, on_frame) or base
+            m, p = _push_column(cables, vision, on_frame, j, push_mm, max_load_ma, log)
+            cables.set_pulls(np.zeros(4))
+            vision.forget_tip(expect=base["pos"])
+            if m is None or np.linalg.norm((m["pos"] - base["pos"])[[0, 2]]) < 3.0:
+                J[:, j] = _between_the_others(J, [k for k in used if k not in push])
+                log(f"Motor {j}: the tip was hidden or held while it pulled: direction taken as the middle of the "
+                    f"widest gap between the other cables, {math.degrees(math.atan2(J[2, j], J[0, j])):+.0f} deg")
+                continue
+            J[:, j] = (m["pos"] - base["pos"]) / p[j]
+            horiz = J[[0, 2], j]
+            log(f"Motor {j} (pushed {p[j]:.0f} mm): on average 1 mm of cable moves the tip {np.linalg.norm(horiz):.2f} mm "
+                f"sideways (direction {math.degrees(math.atan2(horiz[1], horiz[0])):+.0f} deg in the x-z plane)")
+            continue
         m = None
         for pull_mm in (JACOBIAN_PULL_MM, JACOBIAN_PULL_MM / 2):
             base = vision.measure_tip(6, on_frame) or base
@@ -343,11 +368,12 @@ def calibrate(cables, vision, on_frame, first_direction=-1, pull_signs=None, sea
     return calib
 
 
-def _try_direction(cables, vision, on_frame, start, base, j, sign, search_mm, log):
+def _try_direction(cables, vision, on_frame, start, base, j, sign, search_mm, log, push=False):
     """Turn motor j in `sign` direction 1 mm at a time until the tip shifts (TAUT_SHIFT_PX), then
     4 and 8 mm further, and put it back. Returns {"sign", "k": mm at the shift (None: never),
     "growth_px": how far the tip moved between +4 and +8 mm, "current_rise": motor j's current
-    at +8 mm minus at the start (None if unreadable)}."""
+    at +8 mm minus at the start (None if unreadable)}. push: the cable may press the arm on an
+    obstacle where the tip is hidden: then its current rising by TAUT_CURRENT_MA also means taut."""
     angles = start.copy()
     # where the tip is now: after the last cable was let out it may not have sprung all the
     # way back (friction with the platform), and that offset must not count as this cable pulling
@@ -362,7 +388,16 @@ def _try_direction(cables, vision, on_frame, start, base, j, sign, search_mm, lo
             angles[j] = start[j] + sign * k * SEARCH_STEP_RAD
             cables.move_angles(angles)
             m = vision.measure_tip(3, on_frame)
+            if push and current0 is not None:
+                try:
+                    if abs(float(cables.read_currents()[j])) - current0 > TAUT_CURRENT_MA:
+                        out["k"] = k
+                        break
+                except Exception:
+                    pass
             if m is None:
+                if push:
+                    continue
                 raise RuntimeError("Lost the tip during calibration.")
             if np.linalg.norm(m["px"] - ref["px"]) > TAUT_SHIFT_PX:
                 out["k"] = k
@@ -393,6 +428,45 @@ def _try_direction(cables, vision, on_frame, start, base, j, sign, search_mm, lo
     finally:
         cables.move_angles(start)
         vision.forget_tip(expect=base["pos"])
+
+
+def _between_the_others(J, others):
+    """A model column for a cable that couldn't be measured: pointing into the middle of the widest
+    gap between the other cables' directions, as strong as their median."""
+    cols = [J[[0, 2], k] for k in others if np.linalg.norm(J[[0, 2], k]) > 0.2]
+    if len(cols) < 2:
+        raise RuntimeError("Not enough measured cables to place the pushed one: free the arm and calibrate again.")
+    angles = sorted(math.atan2(v[1], v[0]) for v in cols)
+    width, a0 = max(((b - a) % (2 * math.pi), a) for a, b in zip(angles, angles[1:] + angles[:1]))
+    angle, size = a0 + width / 2, float(np.median([np.linalg.norm(v) for v in cols]))
+    return np.array([size * math.cos(angle), 0.0, size * math.sin(angle)])
+
+
+def _push_column(cables, vision, on_frame, j, push_mm, max_load_ma, log):
+    """Pull cable j alone in 5 mm steps up to push_mm (stopping if its current rises by max_load_ma):
+    the furthest tip position seen and the pulls there (for a cable whose first few mm only press
+    the arm on an obstacle)."""
+    limit = list(cables.calib["pull_max_mm"])
+    cables.calib = {**cables.calib, "pull_max_mm": [max(v, push_mm) if k == j else v for k, v in enumerate(limit)]}
+    baseline = np.abs(cables.read_currents())
+    best = (None, None)
+    try:
+        for mm in np.arange(5.0, push_mm + 1e-6, 5.0):
+            p = np.zeros(4)
+            p[j] = mm
+            cables.set_pulls(p)
+            m = vision.measure_tip(4, on_frame)
+            if m is not None:
+                best = (m, p)
+            load = _cable_load(cables, baseline)
+            if load > max_load_ma:
+                log(f"Motor {j}: current +{load:.0f} mA at {mm:.0f} mm, not pushing further")
+                break
+    finally:
+        for frac in (0.5, 0.0):
+            cables.set_pulls(cables.pulls * frac)
+        cables.calib = {**cables.calib, "pull_max_mm": limit}
+    return best
 
 
 def reachability(calib, tip_rest, tol_mm=6.0):

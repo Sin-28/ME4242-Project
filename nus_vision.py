@@ -54,6 +54,7 @@ DEFAULT_CONFIG = {
     "letter_thickness_mm": 5.0,
     "tip_length_mm": 8.0,            # the magnet tip sticks out this far past the green marker the camera tracks
     "holder_slots": {},              # robot (x, y, z) of each letter's slot in the holder: `python nus_main.py holder`
+    "holder_outlines": {},           # each letter's outline as it sits in its slot (x-z, around its magnet)
     "obstacle_height_mm": 8.0,       # anything (any colour) standing this high above the work surface is an
                                      #   obstacle: depth camera, above the letters' thickness + depth noise
     "obstacle_max_height_mm": 150.0, # ...unless part of it reaches higher: then it's a hand or the robot
@@ -65,7 +66,8 @@ DEFAULT_CONFIG = {
     "magnet_min_circularity": 0.6,   # ...if it is round (1 = circle); an S's closed-off inner curve is not
     "shape_min_overlap": 0.6,        # shape mode: best overlap (IoU) with a template to count as a letter
     "min_margin": 0.05,              # shape mode: best letter must beat the runner-up by this much, else "?"
-    "tip_hsv": [[[40, 100, 60], [84, 255, 255]]],      # green tip (measured hue 73-81)
+    "tip_hsv": [[[60, 90, 75], [78, 255, 255]]],       # green tip: hue 72-77, bright (value 88+); the green
+                                                       # printed holder is bluer (hue 79-83) and darker
     "robot_hsv": [                   # shape mode: never a letter (green tip, blue disks, teal legs)
         [[40, 100, 40], [84, 255, 255]],
         [[86, 80, 30], [125, 255, 255]],
@@ -77,6 +79,7 @@ DEFAULT_CONFIG = {
     "min_area_px": 150,
     "max_area_px": 20000,
     "tip_min_area_px": 30,
+    "tip_min_median_sat": 130,       # the marker is saturated (median 150-220); pale highlights on other green parts aren't
     "tip_max_jump_px": 120,          # tip can't jump further than this between frames
     "tip_max_jump_mm": 60.0,         # ...or than this (3D) between measurements, unless the cables were released
     "tip_max_radius_mm": 170.0,      # green blobs further from the robot axis are background objects
@@ -445,6 +448,8 @@ class Vision:
                 continue
             blob = np.zeros(depth.shape, np.uint8)
             cv2.drawContours(blob, [c], -1, 255, -1)
+            if np.median(hsv[..., 1][(blob > 0) & (mask > 0)]) < cfg.get("tip_min_median_sat", 0):
+                continue
             d = depth[blob > 0]
             d = d[d > 0]
             if not len(d):
@@ -750,6 +755,19 @@ class Vision:
                 obstacles.append({**footprint, "kind": d.get("letter") or d.get("color_of") or "?",
                                   "contour": d["contour"]})
         return obstacles
+
+    def letter_outline(self, detection, max_points=80):
+        """A detected letter's outline in the robot's horizontal plane (x, z mm), relative to its
+        pick point (the magnet): the image outline projected onto the letter's top surface.
+        None without a camera transform or position."""
+        if self.camera is None or detection.get("pos") is None:
+            return None
+        pos = np.asarray(detection["pos"], float)
+        pts = detection["contour"].reshape(-1, 2)
+        pts = pts[np.linspace(0, len(pts) - 1, min(max_points, len(pts))).astype(int)]
+        xz = [self.pixel_to_plane(float(u), float(v), pos[1]) for u, v in pts]
+        xz = np.array([p[[0, 2]] for p in xz if p is not None])
+        return None if len(xz) < 3 else xz - pos[[0, 2]]
 
     def _footprint(self, contour, top_y):
         """Circle (centre (x, z), radius mm) around a blob's outline projected onto its own height."""

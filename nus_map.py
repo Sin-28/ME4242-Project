@@ -34,19 +34,21 @@ MAP_PATH = HERE / "workspace_map.json"
 
 def neighbour_pairs(calib):
     """Used cables in order of the direction they pull the tip, and each neighbouring pair:
-    two cables either side of a direction reach every point between their directions."""
+    two cables either side of a direction reach every point between their directions. Cables
+    pulling about opposite ways (more than 135 deg apart, e.g. with a cable missing) aren't paired:
+    pulling both only stiffens the arm."""
     J = np.array(calib["J"], float)
     used = [j for j in range(4) if calib["pull_sign"][j] != 0 and np.linalg.norm(J[[0, 2], j]) > 1e-6]
     order = sorted(used, key=lambda j: math.atan2(J[2, j], J[0, j]))
     if len(order) < 2:
         return []
-    if len(order) == 2:
-        return [tuple(order)]
-    return [(order[i], order[(i + 1) % len(order)]) for i in range(len(order))]
+    pairs = [tuple(order)] if len(order) == 2 else [(order[i], order[(i + 1) % len(order)]) for i in range(len(order))]
+    angle = {j: math.degrees(math.atan2(J[2, j], J[0, j])) for j in order}
+    return [(a, b) for a, b in pairs if abs((angle[a] - angle[b] + 180.0) % 360.0 - 180.0) <= 135.0]
 
 
 def explore(cables, vision, on_frame, pull_max_mm, step_mm=5.0, max_load_ma=1500.0, max_lag_mm=3.0,
-            still_mm=1.0, still_steps=3, only_motors=None, log=print):
+            still_mm=1.0, still_steps=3, only_motors=None, push=(), log=print):
     """For each neighbouring cable pair (a, b): rows of increasing pull on a, sweeping b up and
     down (zigzag, so every move is one step), recording the tip after each move. While a row pulls
     harder it stops (and the next rows stay below that) when:
@@ -56,7 +58,9 @@ def explore(cables, vision, on_frame, pull_max_mm, step_mm=5.0, max_load_ma=1500
       * a motor's current rose by max_load_ma (safety), or the tip is lost,
       * pull_max_mm is reached.
     Between pairs the cables are let out step by step. only_motors: explore only the pairs with one
-    of these motors and keep the rest of the saved map (same calibration). Saves and returns the map."""
+    of these motors and keep the rest of the saved map (same calibration). push: motors whose rows
+    don't stop when the tip stops moving (pressed on an obstacle: pulling harder gets it past),
+    only on the current / lag / pull limits. Saves and returns the map."""
     from nus_control import _cable_load
     pairs = neighbour_pairs(cables.calib)
     if not pairs:
@@ -81,7 +85,7 @@ def explore(cables, vision, on_frame, pull_max_mm, step_mm=5.0, max_load_ma=1500
         baseline = np.abs(cables.read_currents())
     except Exception:
         baseline = np.zeros(4)
-    check_cables(cables, vision, on_frame, rest, log=log)
+    check_cables(cables, vision, on_frame, rest, push=push, log=log)
 
     def too_hard(moved):
         load = _cable_load(cables, baseline)
@@ -97,6 +101,7 @@ def explore(cables, vision, on_frame, pull_max_mm, step_mm=5.0, max_load_ma=1500
             continue
         top = len(levels) - 1                         # highest j (pull on b) the rows may still go to
         reached = 0.0
+        pushing = bool(set((a, b)) & set(push))
         for i, pa in enumerate(levels):
             up = i % 2 == 0
             js = range(0, top + 1) if up else range(top, -1, -1)
@@ -124,7 +129,7 @@ def explore(cables, vision, on_frame, pull_max_mm, step_mm=5.0, max_load_ma=1500
                 samples.append({"pulls": cables.pulls.copy(), "tip": m["pos"], "pair": k, "i": i, "j": j})
                 row_ok = True
                 reached = max(reached, pa, levels[j])
-                if up and prev is not None:
+                if up and prev is not None and not pushing:
                     still = still + 1 if np.linalg.norm(m["pos"][[0, 2]] - prev) < still_mm else 0
                     if still >= still_steps:
                         log(f"  M{a} {pa:.0f} + M{b} {levels[j]:.0f} mm: the tip stopped moving, not pulling further here")
@@ -137,7 +142,7 @@ def explore(cables, vision, on_frame, pull_max_mm, step_mm=5.0, max_load_ma=1500
             # rows start with cable b let out: if the tip hasn't moved for a few rows as a got
             # pulled harder, a is as far as it goes here
             first = [smp for smp in samples if smp["pair"] == k and smp["j"] == 0]
-            if len(first) > still_steps and all(
+            if not (a in push) and len(first) > still_steps and all(
                     np.linalg.norm(first[-1 - n]["tip"][[0, 2]] - first[-2 - n]["tip"][[0, 2]]) < still_mm
                     for n in range(still_steps)):
                 log(f"  M{a} {pa:.0f} mm: the tip stopped moving as M{a} pulled harder, not pulling further")
@@ -158,7 +163,8 @@ def explore(cables, vision, on_frame, pull_max_mm, step_mm=5.0, max_load_ma=1500
     return wmap
 
 
-def check_cables(cables, vision, on_frame, rest, levels_mm=(5.0, 10.0, 15.0, 20.0), min_move_mm=5.0, log=print):
+def check_cables(cables, vision, on_frame, rest, levels_mm=(5.0, 10.0, 15.0, 20.0), min_move_mm=5.0, push=(),
+                 log=print):
     """Pull each used cable alone through levels_mm and check the tip keeps moving: at least
     min_move_mm between the first and the last pull at which the camera sees it. A cable that
     doesn't is being let out instead of pulled (wrong direction in the calibration: letting out a
@@ -189,7 +195,10 @@ def check_cables(cables, vision, on_frame, rest, levels_mm=(5.0, 10.0, 15.0, 20.
         log(f"  M{j} alone: {seen[0][0]:.0f} mm moves the tip {first:.0f} mm, {seen[-1][0]:.0f} mm "
             f"{more:.0f} mm further{note}")
         if more < min_move_mm:
-            bad.append(int(j))
+            if j in push:
+                log(f"  M{j}: pressed on something; pushing it further while exploring (--push)")
+            else:
+                bad.append(int(j))
     if bad:
         raise RuntimeError(
             f"Cable(s) {', '.join(f'M{j}' for j in bad)} stop moving the tip when pulled further: their direction "
@@ -312,13 +321,22 @@ class WorkspaceMap:
     def nearest_setting(self, pulls):
         return int(np.argmin(np.abs(self.pulls - np.asarray(pulls, float)).sum(axis=1)))
 
-    def route(self, start_pulls, goal_xz, blocked=(), penalties=(), tol_mm=None):
+    def route(self, start_pulls, goal_xz, blocked=(), penalties=(), tol_mm=None, forbid=None, goal_y=None,
+              free_near_start_mm=25.0, crossing=None, forbid_cost=None):
         """Cheapest chain of recorded settings from the one nearest start_pulls to one whose tip
         is nearest goal_xz. blocked: [(centre (x, z), radius)] the tip must stay out of (other
         letters); penalties: [(centre, radius, cost)] places to avoid if possible (where an earlier
-        try got stuck). Cost = tip travel (mm) + a little cable change. Returns
-        {"settings": [indices], "pulls": [...], "path": [tip (x, z)], "length", "cost", "end_gap"}
-        or None if the goal can't be reached from here."""
+        try got stuck). forbid: True per setting the route may not pass through (e.g. the letter
+        being carried would hit an obstacle there), except within free_near_start_mm of the start.
+        goal_y: the tip should get down to this height at the goal (to touch a magnet): among the
+        settings near the goal, the one where the tip was lowest wins (height above goal_y counts
+        like distance). crossing(a, b) -> True: the move between settings a and b isn't allowed
+        (e.g. the carried letter would sweep through an obstacle on the way), except near the start.
+        forbid_cost: instead of ruling those out, each one passed costs this much (the least bad way
+        when there is no clean one). Cost = tip travel (mm) + a little cable change. Returns
+        {"settings": [indices], "pulls": [...], "path": [tip (x, z)], "length", "cost", "end_gap",
+        "end_height": tip height above goal_y there (or None), "forbidden": how many forbidden
+        settings or moves it passes} or None if the goal can't be reached."""
         goal = np.asarray(goal_xz, float)
         start = self.nearest_setting(start_pulls)
         n = len(self.pulls)
@@ -331,6 +349,15 @@ class WorkspaceMap:
             extra[np.linalg.norm(self.xz - np.asarray(c, float), axis=1) < r] += cost
         gap = np.linalg.norm(self.xz - goal, axis=1)
         tol = self.tolerance_at(goal) if tol_mm is None else tol_mm
+        def near_start(xz):
+            return np.linalg.norm(xz - self.xz[start]) <= free_near_start_mm
+
+        def is_forbidden(idx, nb):
+            if forbid is not None and forbid[nb] and gap[nb] > tol and not near_start(self.xz[nb]):
+                return True
+            return bool(crossing is not None and not near_start(0.5 * (self.xz[idx] + self.xz[nb]))
+                        and crossing(idx, nb))
+
         best, prev, done = {start: 0.0}, {}, set()
         queue = [(0.0, start)]
         while queue:
@@ -341,15 +368,23 @@ class WorkspaceMap:
             for nb in self._links[idx]:
                 if nb in done or (is_blocked(nb) and gap[nb] > tol):
                     continue
+                bad = is_forbidden(idx, nb)
+                if bad and forbid_cost is None:
+                    continue
                 step = float(np.linalg.norm(self.xz[nb] - self.xz[idx])) + \
-                    0.2 * float(np.abs(self.pulls[nb] - self.pulls[idx]).sum()) + extra[nb]
+                    0.2 * float(np.abs(self.pulls[nb] - self.pulls[idx]).sum()) + extra[nb] + \
+                    (forbid_cost if bad else 0.0)
                 if cost + step < best.get(nb, math.inf):
                     best[nb], prev[nb] = cost + step, idx
                     heapq.heappush(queue, (cost + step, nb))
         candidates = [idx for idx in done if gap[idx] <= max(tol, gap[list(done)].min() + 1e-9)]
         if not candidates:
             return None
-        end = min(candidates, key=lambda idx: (round(gap[idx] / 3.0), best[idx]))   # nearest, then cheapest
+        # nearest first; among those about as near (within 5 mm), the lowest tip, then the cheapest
+        nearest = min(gap[idx] for idx in candidates)
+        close = [idx for idx in candidates if gap[idx] <= max(nearest + 5.0, 4.0)]
+        high = (lambda idx: max(0.0, self.tips[idx, 1] - goal_y)) if goal_y is not None else (lambda idx: 0.0)
+        end = min(close, key=lambda idx: (round(high(idx) / 3.0), best[idx]))
         chain = [end]
         while chain[-1] != start:
             chain.append(prev[chain[-1]])
@@ -357,7 +392,9 @@ class WorkspaceMap:
         path = [self.xz[idx].copy() for idx in chain]
         length = float(sum(np.linalg.norm(b - a) for a, b in zip(path, path[1:])))
         return {"settings": chain, "pulls": [self.pulls[idx].copy() for idx in chain], "path": path,
-                "length": length, "cost": float(best[end]), "end_gap": float(gap[end])}
+                "length": length, "cost": float(best[end]), "end_gap": float(gap[end]),
+                "end_height": None if goal_y is None else float(self.tips[end, 1] - goal_y),
+                "forbidden": sum(is_forbidden(a, b) for a, b in zip(chain, chain[1:]))}
 
 
 # ---------------------------------------------------------------- moving with it

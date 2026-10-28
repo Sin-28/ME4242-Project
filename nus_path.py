@@ -273,3 +273,50 @@ def approach_routes(start, goal, obstacles, support=None, axis=None, clearance_m
         cost = length + inner_penalty * max(0.0, r_goal - float(np.linalg.norm(approach - axis)))
         routes.append({"path": path, "approach": approach, "angle_deg": angle, "cost": cost, "length": length})
     return sorted(routes, key=lambda r: r["cost"])
+
+
+def polygons_overlap(a, b, margin_mm=0.0):
+    """Do two convex polygons overlap (closer than margin_mm counts)? Separating axis test."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if len(a) < 3 or len(b) < 3:
+        return False
+    for poly in (a, b):
+        edges = np.roll(poly, -1, axis=0) - poly
+        for n in np.stack([-edges[:, 1], edges[:, 0]], axis=1):
+            length = np.linalg.norm(n)
+            if length < 1e-12:
+                continue
+            n = n / length
+            pa, pb = a @ n, b @ n
+            if pa.max() + margin_mm <= pb.min() or pb.max() + margin_mm <= pa.min():
+                return False
+    return True
+
+
+def rotate(points, deg):
+    c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    return np.asarray(points, float) @ np.array([[c, s], [-s, c]])
+
+
+def _shape_mask(outline, size_mm=140, mm_per_px=1.0):
+    from cv2 import fillPoly
+    mask = np.zeros((int(size_mm / mm_per_px),) * 2, np.uint8)
+    pts = (np.asarray(outline, float) / mm_per_px + size_mm / mm_per_px / 2).round().astype(np.int32)
+    fillPoly(mask, [pts.reshape(-1, 1, 2)], 1)
+    return mask
+
+
+def relative_yaw(outline, reference, step_deg=3.0):
+    """How far (deg) to turn `outline` (letter outline, x-z mm, relative to its magnet) about the
+    magnet to match `reference` (the same letter as it sits in its slot). Returns (angle in
+    -180..180, overlap 0..1 at that angle)."""
+    ref = _shape_mask(reference)
+    scores = []
+    for deg in np.arange(0.0, 360.0, step_deg):
+        m = _shape_mask(rotate(outline, deg))
+        inter, union = np.logical_and(m, ref).sum(), np.logical_or(m, ref).sum()
+        scores.append(((deg + 180.0) % 360.0 - 180.0, inter / union if union else 0.0))
+    top = max(iou for _, iou in scores)
+    # N and S look the same turned half round: of the (nearly) equally good fits, the smallest turn
+    angle, iou = min(((a, i) for a, i in scores if i >= top - 0.03), key=lambda ai: abs(ai[0]))
+    return float(angle), float(iou)

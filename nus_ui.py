@@ -27,6 +27,7 @@ class Display:
         self.alt_paths = []                                  # other candidate routes, drawn thin
         self.marks = []                                      # (robot (x, y, z), label, BGR colour)
         self.region = None                                   # (outline [(x, z)], height y): where the tip reaches
+        self.shapes = []                                     # ([(x, z)], height y, BGR): e.g. slot outlines
         cv2.namedWindow(WINDOW)
 
     def _to_px(self, x, y, z):
@@ -54,6 +55,10 @@ class Display:
             ring = np.array([p for p in (self._to_px(x, y, z) for x, z in outline) if p is not None], np.int32)
             if len(ring) > 2:
                 cv2.polylines(image, [ring], True, (80, 200, 80), 1, cv2.LINE_AA)
+        for outline, y, colour in self.shapes:
+            ring = np.array([p for p in (self._to_px(x, y, z) for x, z in outline) if p is not None], np.int32)
+            if len(ring) > 2:
+                cv2.polylines(image, [ring], True, colour, 1, cv2.LINE_AA)
         for points, y in self.alt_paths:
             line = np.array([p for p in (self._to_px(x, y, z) for x, z in points) if p is not None], np.int32)
             if len(line) > 1:

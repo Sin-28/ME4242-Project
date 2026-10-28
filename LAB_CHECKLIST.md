@@ -8,10 +8,11 @@ In any camera window, **q / Esc stops** and switches the motors off (Ctrl+C in t
 |---|---|---|---|
 | 1 | `python nus_main.py check --apply` | no | Tip found; surface height saved |
 | 2 | `python nus_main.py calibrate --pull-signs=1,1,1,1` (all +1 on this set, Oct 20 and Oct 26) | yes | 4 cables pulling in **4 different directions all round** (~90 deg apart); no WARNING about two motors pulling the same way or "measured exactly the same". Without --pull-signs it tries both ways per motor |
-| 2b | `python nus_main.py explore` (**obstacles + holder in place, letters OFF**) | yes | First pulls each cable alone 10 then 20 mm and stops if one doesn't keep moving the tip (= backwards in the calibration). Then a few minutes; prints how far the tip reaches. Re-run after every calibrate or when an obstacle moves |
+| 2b | `python nus_main.py explore` (**obstacles + holder in place, letters OFF**) | yes | First pulls each cable alone 10 then 20 mm and stops if one doesn't keep moving the tip (= backwards in the calibration). Then a few minutes; prints how far the tip reaches. Re-run after every calibrate or when an obstacle moves. **The green outline must cover the holder's slots**: if not, `explore --only M1` (the cable(s) pulling toward the holder) adds that side to the map |
 | 3 | `python nus_main.py detect` | no | N, U, S green (teach with click + n/u/s if not); one orange outline per obstacle/block, none on the arm, letters or bare platform |
-| 4 | `python nus_main.py holder` | no | Click each slot + n/u/s, q saves; no "outside the camera's search circle" warning |
-| 5 | `python nus_main.py retrieve --dry-run` | no | Every letter inside the **green outline** (where the tip was seen to reach) with a cyan route round the obstacles; "OUT OF REACH" = move that letter in |
+| 4a | `python nus_main.py jog --teach` (holder in place, one letter on the magnet at a time) | yes | Drive the letter into its slot with the keys, `a` for poses on the way, Enter + n/u/s saves; `p` + letter replays it from the middle to check. `retrieve` then puts that letter in by replaying it (no tip tracking on the holder) |
+| 4 | `python nus_main.py holder` (**each letter sitting in its slot**) | no | Click each letter in its slot + n/u/s ("from the N sitting in it"), q saves; no "outside the camera's search circle" warning. Then take the letters out and lay them on the table **turned the same way as in their slots** |
+| 5 | `python nus_main.py retrieve --dry-run` | no | Every letter inside the **green outline** (where the tip was seen to reach) with a cyan route round the obstacles; "OUT OF REACH" = move that letter in. No "lies turned ... WARNING" (turn that letter on the table) |
 | 6 | `python nus_main.py retrieve --no-place --record` | yes | Reaches each magnet; when caught it gives up after 3 s, goes back to the middle, tries another side |
 | 7 | `python nus_main.py retrieve --record` | yes | Grab -> carry -> slot; read `runs/retrieve_log.csv` afterwards |
 
@@ -20,7 +21,9 @@ bends nonlinearly, a tip resting on the platform sticks and slips, and around th
 on them or gets caught. `explore` runs with the real set-up (obstacles and holder where they will be
 in the final run; only the letters off, the magnet would pick them up) and pulls every pair of
 neighbouring cables through a grid, each row as far as the arm goes: until the tip stops moving, a
-motor can't pull further, its current rises by `--max-ma` (800 mA) or `--pull-max-mm` (50, max 60).
+motor can't pull further, its current rises by `--max-ma` (1500 mA) or `--pull-max-mm` (50, max 60).
+`--only M1` (or `--only M0,M1`) explores again only the cable pairs with those motors and merges
+the result into the map (for a side that stopped short).
 `retrieve` then plans each route as a chain of these recorded settings (the tip was really seen
 there, contacts included), keeps clear of the other letters, plays the chain back, and corrects at
 the end with the camera. If an attempt gets stuck, that spot is avoided in the next plan. Move an
@@ -129,11 +132,18 @@ Results: `runs/search_results.csv` (one row per letter + one "ALL" row per trial
 raised_mm and above_letter_mm = tip height above the letter at the end) and `runs/search_*.mp4`.
 
 ## 5. Retrieve: pick the letters up and put them in the holder (trial and error)
-Teach the holder once per set-up (camera only): put the holder in place, then
+Teach the holder once per set-up (camera only): put the holder in place **with each letter
+sitting in its slot**, then
 ```
 python nus_main.py holder
 ```
-click the middle of each slot (where that letter's magnet ends up) and press n / u / s; q saves.
+click each letter and press n / u / s; q saves. That learns where its magnet sits in the slot and
+which way the letter faces there (`holder_outlines` in nus_config.json). (Clicking the middle of an
+empty slot still works, but then the orientation can't be checked.)
+**The arm can't turn a letter** (it has no wrist and the magnet holds the letter as it was lying),
+so lay each letter on the table turned the way it sits in its slot. `retrieve` measures it: "N lies
+turned -39 deg from its slot - WARNING" means turn N by about that much (more than `--yaw-tol-deg`
+20 won't go in). N and S look the same turned half round, so the smaller turn is given.
 Check the plan without moving (camera only), then run it:
 ```
 python nus_main.py retrieve --dry-run                one look at the plan (30 s, then it stops)
@@ -153,6 +163,16 @@ What it does, until all three letters are in their slots (q in the window or Ctr
 4. at the magnet: lines up to 4 mm, touches it, backs off and checks the letter came along
    (it's gone from where it lay); carries it to its slot the same way, puts it down, goes back to
    the middle and checks the letter is in the slot (`--slot-tol-mm` 15).
+   **While carrying**, the whole letter hangs under the tip: the route keeps the letter's outline
+   (as seen before picking it up, + `--carry-margin-mm` 5) clear of every obstacle it isn't carried
+   above (the tip's height there is known from the map; the block it was lifted from and the last
+   30 mm into the slot are allowed). If no route keeps it fully clear, it takes the one that brushes
+   the fewest obstacles and says "it may brush an obstacle".
+   **Height:** the tip rises as the arm bends out, so far out it may stay above the magnet. Of the
+   recorded settings next to a letter, the one with the lowest tip is used; "the lowest the map
+   saw the tip near it is 16 mm above touching" / "the tip is 15 mm above touching the magnet"
+   (more than `--touch-height-mm` 12) means the magnet probably won't take it there: move that
+   letter closer to the middle or onto a higher block.
 Every attempt is logged in `runs/retrieve_log.csv` (letter, side, stage, result, reason).
 
 ## If something goes wrong
@@ -171,7 +191,9 @@ Every attempt is logged in `runs/retrieve_log.csv` (letter, side, stage, result,
 | Letters detected in the wrong place | `stage_y_mm` in `nus_config.json` must match the surface height (-290 bare platform, about -228 raised) |
 | `retrieve`: "No route left to try" | Every side failed twice: move the letter or the obstacle, or try `--route avoid` |
 | `retrieve`: tip keeps getting caught on a block's edge | Raise `--tip-mm` (more clearance), or lower that block |
-| `retrieve`: "letter didn't come along" | The magnet didn't take it: check the tip's magnet; `--success-mm 5` lines up closer |
+| `retrieve`: "letter didn't come along" | The magnet didn't take it: check the tip's magnet; `--success-mm 5` lines up closer. "... mm above touching" = too low for the arm there: move the letter in or onto a higher block |
+| `retrieve`: "no route to the slot" | The map doesn't reach the holder: `explore --only M1` (the cable pulling toward the holder) with the holder in place, or move the holder closer to the middle |
+| `retrieve`: "lies turned ... WARNING" | Turn that letter on the table by about that angle (to match its slot) |
 | An obstacle isn't outlined | Click on it in `detect`: if it prints less than 8 mm above the surface, lower `obstacle_height_mm`; "no depth reading" = shiny/black top, put tape on it |
 | Outlines on the platform / noise | Raise `obstacle_height_mm` (e.g. 12) |
 | Part of the arm is outlined | It must touch the tip or reach up to the robot to be left out: tell me, or move the arm clear when starting |

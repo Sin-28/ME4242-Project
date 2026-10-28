@@ -31,11 +31,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from nus_control import (Cables, Watchdog, align_to_calibration, describe_model, load_calibration, lower_onto,
+from nus_control import (Cables, Watchdog, _cable_load, align_to_calibration, describe_model, load_calibration, lower_onto,
                          move_tip_adaptive, move_tip_along, probe_model, reachability, reset_live_model,
                          set_live_model)
 from nus_map import follow, load_map, play
-from nus_path import approach_routes, densify, path_length, plan_path, support_of
+from nus_path import (approach_routes, convex_hull, densify, footprint, path_length, plan_path, polygons_overlap,
+                      relative_yaw, support_of)
 from nus_ui import WINDOW, Display, Recorder, open_camera_or_exit, stable_objects
 from nus_vision import LETTERS, Vision, fmt, save_config_value
 
@@ -52,7 +53,7 @@ def scan_scene(vision, display, todo, frames=12, wait_s=8.0, lines=()):
     Keeps looking for up to wait_s seconds until every letter in `todo` has been seen."""
     seen = {L: deque(maxlen=frames) for L in LETTERS}
     objects_seen = deque(maxlen=5)
-    start, n, letter_obstacles = time.time(), 0, {}
+    start, n, letter_obstacles, last = time.time(), 0, {}, {}
     while True:
         frame, depth = vision.grab()
         detections, candidates = vision.detect_letters(frame, depth)
@@ -63,6 +64,8 @@ def scan_scene(vision, display, todo, frames=12, wait_s=8.0, lines=()):
         for L in LETTERS:
             d = detections.get(L)
             seen[L].append(d if d is not None and d["pos"] is not None else None)
+            if d is not None and d["pos"] is not None:
+                last[L] = d
         n += 1
         display.candidates, display.detections = candidates, detections
         display.obstacles = stable_objects(objects_seen) + list(letter_obstacles.values())
@@ -77,7 +80,16 @@ def scan_scene(vision, display, todo, frames=12, wait_s=8.0, lines=()):
     for L, f in letters.items():                      # letter footprint (a circle) for the planner
         o = letter_obstacles.get(L) or {"centre": f["pos"][[0, 2]], "radius": 25.0, "height_y": f["pos"][1]}
         f["obstacle"] = dict(o, kind=L)
+        f["outline"] = vision.letter_outline(last[L]) if L in last else None   # x-z, relative to its magnet
     return letters, objects
+
+
+def orientation(ctx, L, letter):
+    """(turn in deg, overlap) to bring the letter as it lies into the orientation of its slot, or None."""
+    ref = ctx.get("slot_outlines", {}).get(L)
+    if ref is None or letter.get("outline") is None:
+        return None
+    return relative_yaw(letter["outline"], ref)
 
 
 def in_slot(letter, slots, L, tol_mm):
@@ -86,7 +98,8 @@ def in_slot(letter, slots, L, tol_mm):
 
 # ---------------------------------------------------------------- planning
 
-def plan(ctx, start_xz, goal_xyz, letters, objects, skip=(), failed=(), carrying=False, start_pulls=None):
+def plan(ctx, start_xz, goal_xyz, letters, objects, skip=(), failed=(), carrying=False, start_pulls=None,
+         carried=None):
     """Candidate routes from start_xz (cables at start_pulls, default all let out) to goal_xyz.
     With a workspace map: the cheapest chain of recorded pull settings to the goal (the obstacles
     were in place while exploring, so contacts are in it), keeping clear of the letters not in
@@ -95,28 +108,45 @@ def plan(ctx, start_xz, goal_xyz, letters, objects, skip=(), failed=(), carrying
     around every object except the one under the goal, grown by the tip's length, and the letters."""
     args, cfg = ctx["args"], ctx["cfg"]
     goal = np.asarray(goal_xyz, float)[[0, 2]]
-    margin = args.carry_margin_mm if carrying else 0.0
+    touch_y = float(goal_xyz[1]) + cfg["tip_length_mm"]           # marker height when the magnet touches
+    # the carried letter hangs on the tip: its footprint (outline as it was picked up; the arm can't
+    # turn it) must clear the obstacles, unless it is carried higher than them
+    outline = None if carried is None else carried.get("outline")
+    if carrying and outline is None:
+        outline = circle_outline(25.0)                             # shape unknown: a 25 mm disk
+    reach_out = 0.0 if outline is None else float(np.linalg.norm(outline, axis=1).max())
+    margin = reach_out + args.carry_margin_mm if carrying else 0.0
     wmap = ctx.get("map")
     if wmap is not None and wmap.has_routes():
         blocked = [(np.asarray(f["obstacle"]["centre"], float), f["obstacle"]["radius"] + args.clearance_mm + margin)
                    for L, f in letters.items() if L not in skip]
         penalties = [(spot, 20.0, 300.0) for f in failed for spot in (f.get("spot"), f.get("approach"))
                      if spot is not None]
-        r = wmap.route(np.zeros(4) if start_pulls is None else start_pulls, goal, blocked, penalties)
-        if r is None or r["end_gap"] > args.success_mm + wmap.tolerance_at(goal):
+        lifted_from = None if carried is None or carried.get("pos") is None else np.asarray(carried["pos"])[[0, 2]]
+        forbid, crossing = (carry_check(ctx, wmap, outline, objects, goal, lifted_from=lifted_from) if carrying
+                            else (None, None))
+        start_pulls = np.zeros(4) if start_pulls is None else start_pulls
+        reach = args.success_mm + wmap.tolerance_at(goal)
+        r = wmap.route(start_pulls, goal, blocked, penalties, forbid=forbid, goal_y=touch_y, crossing=crossing)
+        if carrying and (r is None or r["end_gap"] > reach):
+            # no way keeps the letter clear of everything: the way that brushes the fewest obstacles
+            r = wmap.route(start_pulls, goal, blocked, penalties, forbid=forbid, goal_y=touch_y, crossing=crossing,
+                           forbid_cost=200.0)
+        if r is None or r["end_gap"] > reach:
             return [], None
         path = [np.asarray(p, float) for p in r["path"]] + [goal]
         before = path[-2]
         angle = float(np.degrees(np.arctan2(*(before - goal)[::-1]))) % 360.0
         return [{"path": path, "pulls": r["pulls"], "approach": before, "angle_deg": angle,
-                 "cost": r["cost"], "length": r["length"], "graph": True}], None
+                 "cost": r["cost"], "length": r["length"], "graph": True, "end_height": r["end_height"],
+                 "brushes": r["forbidden"]}], None
     failed = [f["angle"] for f in failed]
-    extra = cfg["tip_length_mm"] + (args.carry_margin_mm if carrying else 0.0)
+    extra = cfg["tip_length_mm"] + margin
     support = support_of(goal, objects)
     hug = args.hug_mm if args.route == "contact" else args.clearance_mm
     others = [dict(o, inflate=hug + extra) for o in objects if o is not support]
     # letters: the clearance only (the tip's length matters at rigid edges, where it catches)
-    others += [dict(f["obstacle"], inflate=args.clearance_mm + (args.carry_margin_mm if carrying else 0.0))
+    others += [dict(f["obstacle"], inflate=args.clearance_mm + margin)
                for L, f in letters.items() if L not in skip]
     if support is not None:
         support = dict(support, inflate=cfg["tip_length_mm"] + 2.0)
@@ -135,6 +165,45 @@ def plan(ctx, start_xz, goal_xyz, letters, objects, skip=(), failed=(), carrying
             routes = [{"path": list(path), "approach": before, "angle_deg": angle, "cost": length + 1000.0,
                        "length": length, "direct": True}]
     return routes, support
+
+
+def circle_outline(radius, n=16):
+    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return radius * np.stack([np.cos(angles), np.sin(angles)], axis=1)
+
+
+def carry_check(ctx, wmap, outline, objects, goal, into_goal_mm=30.0, lifted_from=None):
+    """Where the carried letter (convex outline + carry_margin_mm, at the tip) would hit an
+    obstacle it isn't carried above. Returns (forbid: True per map setting, crossing(a, b):
+    True if halfway between two settings it would). The last into_goal_mm before the goal are
+    allowed (the letter goes into the holder there), and so is the block it was lifted from
+    (it starts on top of that one and slides off it)."""
+    args, cfg = ctx["args"], ctx["cfg"]
+    shape = footprint({"polygon": convex_hull(outline)}, args.carry_margin_mm)
+    below_marker = cfg["tip_length_mm"] + cfg["letter_thickness_mm"] + 3.0   # letter bottom under the marker
+    under = None if lifted_from is None else support_of(lifted_from, objects)
+    polys = [(o, footprint(o)) for o in objects if o is not under]
+
+    def hits(xz, tip_y):
+        if np.linalg.norm(xz - goal) < into_goal_mm:
+            return False
+        return any(tip_y - below_marker <= o["height_y"] + 3.0 and polygons_overlap(shape + xz, poly)
+                   for o, poly in polys)
+
+    forbid = np.array([hits(xz, wmap.tips[idx, 1]) for idx, xz in enumerate(wmap.xz)], bool)
+    cache = {}
+
+    def crossing(a, b):
+        key = (min(a, b), max(a, b))
+        if key not in cache:
+            cache[key] = hits(0.5 * (wmap.xz[a] + wmap.xz[b]), min(wmap.tips[a, 1], wmap.tips[b, 1]))
+        return cache[key]
+    return forbid, crossing
+
+
+def carry_forbidden(ctx, wmap, outline, objects, goal, into_goal_mm=30.0, lifted_from=None):
+    """Map settings where the carried letter would hit an obstacle (see carry_check)."""
+    return carry_check(ctx, wmap, outline, objects, goal, into_goal_mm, lifted_from)[0]
 
 
 def show_plans(display, plans, chosen=None, marks=()):
@@ -257,9 +326,15 @@ def cmd_retrieve(cfg, args):
     if calib is None:
         sys.exit("No cable_calibration.json yet: run `python nus_main.py calibrate` first.")
     slots = {L: np.asarray(p, float) for L, p in (cfg.get("holder_slots") or {}).items()}
-    if not args.no_place and not args.dry_run and set(slots) != set(LETTERS):
-        sys.exit("The holder's slots aren't taught yet (" + ", ".join(sorted(set(LETTERS) - set(slots))) +
-                 " missing): run `python nus_main.py holder`, or `retrieve --no-place` to only reach the magnets.")
+    taught = cfg.get("holder_pull_paths") or {}
+    missing = sorted(set(LETTERS) - set(slots) - set(taught))
+    if not args.no_place and not args.dry_run and missing:
+        sys.exit("The holder's slots aren't taught yet (" + ", ".join(missing) + " missing): run `python nus_main.py "
+                 "jog --teach` (drive each letter in by hand) or `holder`, or `retrieve --no-place` to only reach the magnets.")
+    for L, t in taught.items():
+        if t.get("calibration") != calib.get("created"):
+            print(f"Note: slot {L}'s taught path was made with another calibration ({t.get('calibration')}); the pulls "
+                  "are counted from each cable's taut point, so it should still fit. Teach it again if it misses.")
     if args.tip_mm is not None:
         cfg["tip_length_mm"] = args.tip_mm
     wmap = None if args.no_map else load_map(calib, pull_limit=args.pull_max_mm)
@@ -300,6 +375,12 @@ def cmd_retrieve(cfg, args):
                   f"(green outline), cables up to {pull_max:.0f} mm.")
         ctx["slot_marks"] = [(tuple(p), f"slot {L}", COLOURS[L]) for L, p in slots.items()]
         display.marks = list(ctx["slot_marks"])
+        ctx["slot_outlines"] = {L: np.asarray(o, float) for L, o in (cfg.get("holder_outlines") or {}).items()
+                                if L in slots and len(o) >= 3}
+        display.shapes = [(ctx["slot_outlines"][L] + slots[L][[0, 2]], slots[L][1], COLOURS[L]) for L in ctx["slot_outlines"]]
+        if slots and len(ctx["slot_outlines"]) < len(slots):
+            print("Slots taught without their letters in them: orientation can't be checked. To check it, put each "
+                  "letter in its slot and teach it again with `python nus_main.py holder`.")
         print(f"Tip at the middle: {fmt(rest['pos'])}. Tip length past the marker: {cfg['tip_length_mm']:.0f} mm. "
               + ("Holder slots: " + ", ".join(f"{L} {fmt(p)}" for L, p in slots.items()) if slots else "No holder slots."))
         for L, p in slots.items():
@@ -369,6 +450,14 @@ def cmd_retrieve(cfg, args):
                  f"{len(r)} side(s) left)") for k, (r, _) in plans.items()))
 
             if args.dry_run:
+                for k in plans:
+                    turn = orientation(ctx, k, letters[k])
+                    if turn is not None:
+                        print(f"  {k} lies turned {turn[0]:+.0f} deg from its slot"
+                              + (" - turn it on the table, the arm can't" if abs(turn[0]) > args.yaw_tol_deg else ""))
+                    h = plans[k][0][0].get("end_height")
+                    if h is not None:
+                        print(f"  {k}: lowest tip the map has near it: {h:+.0f} mm from touching")
                 display.lines = [f"DRY RUN: would go to {L} first (side {route['angle_deg']:.0f} deg)  q = quit",
                                  "cyan = chosen route, grey = other candidates, dots = approach points"]
                 end = time.time() + args.dry_run_s
@@ -377,6 +466,14 @@ def cmd_retrieve(cfg, args):
                     display.show(frame, vision.find_tip(frame, depth))
                 break
 
+            turn = orientation(ctx, L, letters[L])
+            if turn is not None:
+                print(f"{L} lies turned {turn[0]:+.0f} deg from its slot (shape match {turn[1]:.2f})"
+                      + (f" - WARNING: more than {args.yaw_tol_deg:.0f} deg; the arm can't turn a letter, so turn it on "
+                         "the table to match its slot or it won't go in" if abs(turn[0]) > args.yaw_tol_deg else ""))
+            if route.get("end_height") is not None and route["end_height"] > args.touch_height_mm:
+                print(f"{L}: the lowest the map saw the tip near it is {route['end_height']:.0f} mm above touching "
+                      "(the arm rises as it bends out): the magnet may not reach it from here")
             attempts[L] += 1
             target = letters[L]["pos"]
             display.target_px, display.target_pos = letters[L]["px"], target
@@ -389,6 +486,11 @@ def cmd_retrieve(cfg, args):
             stage, ok = "reach", out["reached"]
             if ok:
                 touch(ctx, target)
+                tip_now = ctx["vision"].measure_tip(3, display.show)
+                if tip_now is not None:
+                    above = tip_now["pos"][1] - (target[1] + cfg["tip_length_mm"])
+                    if above > args.touch_height_mm:
+                        print(f"  {L}: the tip is {above:.0f} mm above touching the magnet (it can't get lower here)")
                 if args.no_place:
                     print(f"  {L}: reached its magnet ({out['error_mm']:.1f} mm off)")
                     placed.add(L)
@@ -398,7 +500,7 @@ def cmd_retrieve(cfg, args):
                     out["reason"] = "picked up" if ok else "letter didn't come along"
                     if ok:
                         stage = "place"
-                        ok, out = place(ctx, L, slots[L], letters, objects, placed)
+                        ok, out = place(ctx, L, slots.get(L), letters, objects, placed)
                         if ok:
                             placed.add(L)
             rows.append(log_row(L, attempts[L], stage, route, ok, out, time.time() - started, target))
@@ -433,6 +535,14 @@ def place(ctx, L, slot, letters, objects, placed):
     """Carry the picked-up letter to its slot (planned like a letter: the holder is the support),
     put it down, back off to the middle, and check it is there. Returns (ok, outcome)."""
     args = ctx["args"]
+    taught = (ctx["cfg"].get("holder_pull_paths") or {}).get(L)
+    if taught:
+        return place_taught(ctx, L, slot, taught, letters)
+    turn = orientation(ctx, L, letters.get(L, {}))
+    if turn is not None:
+        print(f"    {L} is carried turned {turn[0]:+.0f} deg from its slot"
+              + (f": WARNING, more than {args.yaw_tol_deg:.0f} deg, it probably won't go in (the arm can't turn it)"
+                 if abs(turn[0]) > args.yaw_tol_deg else ""))
     if ctx.get("map") is None:
         measure_here(ctx)                            # without a map: the model for this bent pose
     out = {"reached": False, "reason": "no route to the slot", "error_mm": np.nan, "tip": None}
@@ -441,12 +551,14 @@ def place(ctx, L, slot, letters, objects, placed):
         tip = ctx["vision"].measure_tip(3, ctx["display"].show)
         start = tip["pos"][[0, 2]] if tip is not None else ctx["middle"]
         routes, _ = plan(ctx, start, slot, letters, objects, skip={L} | placed, failed=tried, carrying=True,
-                         start_pulls=ctx["cables"].pulls.copy())
+                         start_pulls=ctx["cables"].pulls.copy(), carried=letters.get(L))
         if not routes:
             break
         route = routes[0]
         ctx["display"].path, ctx["display"].target_pos = (route["path"], slot[1]), slot
-        print(f"    carrying {L} to its slot from side {route['angle_deg']:.0f} deg")
+        print(f"    carrying {L} to its slot from side {route['angle_deg']:.0f} deg"
+              + (f" (no way keeps it fully clear: it may brush an obstacle {route['brushes']} time(s))"
+                 if route.get("brushes") else ""))
         out = drive(ctx, route, slot, args.success_mm)
         if out["reached"]:
             break
@@ -463,6 +575,63 @@ def place(ctx, L, slot, letters, objects, placed):
         letters[L]["pos"] = now
         return False, {**out, "reason": f"dropped at {fmt(now)}, not in the slot"}
     return False, {**out, "reason": "not seen after letting go (still on the magnet?)"}
+
+
+def place_taught(ctx, L, slot, taught, letters):
+    """Put the picked-up letter in its slot by replaying, from the middle, the cable poses taught
+    with `jog --teach` (no tip tracking on the holder), let go, and check it is there."""
+    print(f"    carrying {L} to its slot along the taught path ({len(taught['pulls'])} pose(s))")
+    back_to_middle(ctx)                              # the taught path starts from the middle
+    ok, why = replay(ctx["cables"], ctx["vision"], ctx["display"], taught["pulls"])
+    out = {"reached": ok, "reason": why, "error_mm": np.nan, "tip": None}
+    if not ok:
+        return False, out
+    hold(ctx, 0.8)
+    back_to_middle(ctx)                              # the slot keeps the letter, the magnet lets go
+    if slot is None:
+        return True, {**out, "reason": "put in along the taught path (slot position not taught: not checked)"}
+    now = where_is(ctx, L)
+    if now is not None and np.hypot(*(now[[0, 2]] - slot[[0, 2]])) < ctx["args"].slot_tol_mm:
+        return True, {**out, "reason": "in its slot"}
+    if now is not None:
+        letters[L]["pos"] = now
+        return False, {**out, "reason": f"dropped at {fmt(now)}, not in the slot"}
+    return False, {**out, "reason": "not seen after letting go (still on the magnet?)"}
+
+
+def replay(cables, vision, display, sequence, step_mm=2.5, max_load_ma=1500.0):
+    """Move the cables through a taught sequence of pulls, no motor changing more than step_mm per
+    move. The camera only shows; it doesn't steer. Stops if a motor's current rises by
+    max_load_ma (caught on something). Returns (ok, reason)."""
+    limit = list(cables.calib["pull_max_mm"])
+    cables.calib = {**cables.calib, "pull_max_mm": [TEACH_PULL_MAX_MM if s else 0.0 for s in cables.calib["pull_sign"]]}
+    try:
+        baseline = np.abs(cables.read_currents())
+    except Exception:
+        baseline = np.zeros(4)
+    try:
+        for target in sequence:
+            target, start = np.asarray(target, float), cables.pulls.copy()
+            n = max(1, int(np.ceil(np.abs(target - start).max() / step_mm)))
+            for k in range(1, n + 1):
+                cables.set_pulls(start + (target - start) * k / n)
+                frame, depth = vision.grab()
+                display.show(frame, vision.find_tip(frame, depth))
+                load = _cable_load(cables, baseline)
+                if load > max_load_ma:
+                    return False, f"motor current +{load:.0f} mA on the way: caught on something"
+        return True, "reached the taught pose"
+    finally:
+        cables.calib = {**cables.calib, "pull_max_mm": limit}
+
+
+def release(cables, vision, display):
+    """Let all cables go in a few steps (the arm goes back to the middle)."""
+    for frac in (0.66, 0.33, 0.0):
+        cables.set_pulls(cables.pulls * frac)
+        frame, depth = vision.grab()
+        display.show(frame, vision.find_tip(frame, depth))
+    vision.forget_tip()
 
 
 def log_row(L, attempt, stage, route, ok, out, seconds, target):
@@ -496,6 +665,7 @@ def cmd_holder(cfg, args):
     vision = Vision(cfg, camera)
     display = Display(vision)
     slots = {L: list(p) for L, p in (cfg.get("holder_slots") or {}).items()}
+    outlines = {L: o for L, o in (cfg.get("holder_outlines") or {}).items() if L in slots}
     state = {"click": None, "depth": None}
 
     def on_mouse(event, x, y, flags, param):
@@ -503,7 +673,8 @@ def cmd_holder(cfg, args):
             state["click"] = (x, y)
 
     cv2.setMouseCallback(WINDOW, on_mouse)
-    print("Click the middle of a slot (where that letter's magnet ends up), then press n / u / s. "
+    print("Best: put each letter in its slot, click it, press n / u / s (learns where its magnet sits and which\n"
+          "way it faces). Otherwise click the middle of an empty slot and press the key (position only).\n"
           "c = clear all, q = save and quit.")
     try:
         while True:
@@ -518,6 +689,19 @@ def cmd_holder(cfg, args):
             if key in (ord("n"), ord("u"), ord("s")) and state["click"] is not None:
                 L = chr(key).upper()
                 u, v = state["click"]
+                # best: the letter itself sitting in its slot -> its magnet position and its orientation
+                found, _ = vision.detect_letters(frame, depth)
+                d = found.get(L)
+                on_it = d is not None and (np.hypot(*(d["px"] - np.array([u, v]))) < 40 or cv2.pointPolygonTest(
+                    d["contour"].astype(np.int32), (float(u), float(v)), True) > -10)
+                if on_it and d["pos"] is not None:
+                    slots[L] = [round(float(c), 1) for c in d["pos"]]
+                    out = vision.letter_outline(d)
+                    if out is not None:
+                        outlines[L] = np.round(out, 1).tolist()
+                    print(f"Slot {L}: {fmt(d['pos'])}, from the {L} sitting in it (position and orientation)")
+                    continue
+                outlines.pop(L, None)
                 window = depth[max(v - 3, 0):v + 4, max(u - 3, 0):u + 4]
                 d = window[window > 0]
                 pos = (vision.pixel_to_robot(u, v, float(np.median(d))) if len(d) >= 5
@@ -529,14 +713,112 @@ def cmd_holder(cfg, args):
                 print(f"Slot {L}: {fmt(pos)}" + ("   WARNING: outside the camera's search circle, move the holder "
                                                  "closer to the middle" if np.hypot(pos[0], pos[2]) > cfg["max_radius_mm"] - 10 else ""))
             elif key == ord("c"):
-                slots = {}
+                slots, outlines = {}, {}
     except KeyboardInterrupt:
         pass
     finally:
         camera.close()
         cv2.destroyAllWindows()
     save_config_value("holder_slots", slots)
+    save_config_value("holder_outlines", outlines)
     print(f"Saved holder_slots ({', '.join(sorted(slots)) or 'none'}) to nus_config.json")
+
+
+# ---------------------------------------------------------------- teach the holder by hand
+
+TEACH_PULL_MAX_MM = 60.0
+
+
+def cmd_teach(cfg, args):
+    """Drive the arm by keyboard (cable pulls from the calibration's taut points) until the letter
+    on the magnet sits in its slot, keeping poses on the way (a), then save that sequence for the
+    slot (Enter, then n / u / s). `retrieve` replays it to put that letter in."""
+    calib = load_calibration()
+    if calib is None:
+        sys.exit("No cable_calibration.json yet: run `python nus_main.py calibrate` first.")
+    unused = [j for j in range(4) if calib["pull_sign"][j] == 0]
+    if unused:
+        print(f"WARNING: {', '.join(f'M{j}' for j in unused)} UNUSED in the calibration, so it can't move here. "
+              "Calibrate again (e.g. `calibrate --pull-signs=1,1,1,1 --push M0`) if the holder needs it.")
+    paths = dict(cfg.get("holder_pull_paths") or {})
+    print("Teach each slot: put the letter on the magnet, then drive the arm until the letter sits in its slot.\n"
+          "  0-3 select a motor   w / s = pull +1 / -1 mm   W / S = +5 / -5 mm\n"
+          "  a = keep this pose as a step on the way (e.g. above the holder's edge)   x = forget the steps\n"
+          "  Enter, then n / u / s = save the steps + this pose for that slot\n"
+          "  r = let all cables go (back to the middle)   p, then n / u / s = replay a saved slot from the middle\n"
+          "  q = quit (each slot is saved to nus_config.json as soon as you save it)")
+    camera = open_camera_or_exit()
+    vision = Vision(cfg, camera)
+    display = Display(vision)
+    cables = Cables(calib)
+    steps_mm = {ord("w"): 1.0, ord("s"): -1.0, ord("W"): 5.0, ord("S"): -5.0}
+    letter_keys = {ord("n"): "N", ord("u"): "U", ord("s"): "S"}
+    try:
+        if not cables.open():
+            print("Could not connect to the motors (power on? USB plugged in? EMIO Labs closed?).")
+            return
+        align_to_calibration(cables)
+        limit = [TEACH_PULL_MAX_MM if s else 0.0 for s in calib["pull_sign"]]
+        cables.calib = {**cables.calib, "pull_max_mm": limit}
+        cables.set_pulls(np.zeros(4))
+        motor, steps, waiting = 0, [], None          # waiting: "save" / "play" (after Enter / p)
+        while True:
+            frame, depth = vision.grab()
+            tip = vision.find_tip(frame, depth)
+            prompt = {"save": "save for which slot?  n / u / s", "play": "replay which slot?  n / u / s"}
+            display.lines = [f"M{motor} selected | pulls " + "  ".join(f"M{j} {cables.pulls[j]:.0f}" for j in range(4)) + " mm",
+                             f"{len(steps)} step(s) kept | saved: {', '.join(sorted(paths)) or 'none'}",
+                             prompt.get(waiting, "0-3 w/s W/S move | a step | Enter save | x forget | r release | p replay | q quit")]
+            key = display.show(frame, tip)
+            if key == 255:
+                continue
+            if waiting is not None:
+                mode, waiting, L = waiting, None, letter_keys.get(key)
+                if L is None:
+                    continue
+                if mode == "save":
+                    seq = [[round(float(v), 1) for v in p] for p in steps + [cables.pulls.copy()]]
+                    paths[L] = {"pulls": seq, "calibration": calib.get("created"),
+                                "tip": None if tip is None else [round(float(v), 1) for v in tip["pos"]]}
+                    save_config_value("holder_pull_paths", paths)
+                    print(f"Saved slot {L}: {len(seq)} pose(s), ending at pulls {seq[-1]} mm")
+                    steps = []
+                elif L in paths:
+                    release(cables, vision, display)
+                    ok, why = replay(cables, vision, display, paths[L]["pulls"])
+                    print(f"Replayed slot {L}: {why}")
+                else:
+                    print(f"No path saved for {L} yet.")
+                continue
+            if ord("0") <= key <= ord("3"):
+                motor = key - ord("0")
+                if limit[motor] == 0:
+                    print(f"M{motor} is UNUSED in the calibration: it won't move.")
+            elif key in steps_mm:
+                p = cables.pulls.copy()
+                p[motor] = float(np.clip(p[motor] + steps_mm[key], 0.0, limit[motor]))
+                cables.set_pulls(p)
+            elif key == ord("a"):
+                steps.append(cables.pulls.copy())
+                print(f"Step {len(steps)}: pulls {[round(float(v), 1) for v in steps[-1]]} mm")
+            elif key in (13, 10):
+                waiting = "save"
+            elif key == ord("p"):
+                waiting = "play"
+            elif key == ord("x"):
+                steps = []
+            elif key == ord("r"):
+                release(cables, vision, display)
+                steps = []
+    except KeyboardInterrupt:
+        pass
+    except (RuntimeError, ValueError) as e:
+        print(f"Stopped: {e}")
+    finally:
+        cables.close()
+        camera.close()
+        cv2.destroyAllWindows()
+    print(f"Taught slots: {', '.join(sorted(paths)) or 'none'} (holder_pull_paths in nus_config.json)")
 
 
 # ---------------------------------------------------------------- map the workspace
@@ -547,6 +829,12 @@ def cmd_explore(cfg, args):
     calib = load_calibration()
     if calib is None:
         sys.exit("No cable_calibration.json yet: run `python nus_main.py calibrate` first.")
+    unused = [j for j in range(4) if calib["pull_sign"][j] == 0]
+    if unused:
+        sys.exit(f"The calibration has no cable for {', '.join(f'M{j}' for j in unused)} (UNUSED: the tip didn't move "
+                 "while it searched), so explore couldn't reach that side of the workspace. Its cable is probably "
+                 "slack (the spools unwind while the motors are off): run `python nus_main.py calibrate "
+                 "--pull-signs=1,1,1,1` again (it now searches 50 mm), then explore.")
     print(f"Explore pulls each pair of neighbouring cables through a grid (every {args.step_mm:.0f} mm) as far as "
           f"the arm goes: until the tip stops moving, a motor can't pull further, its current rises by "
           f"{args.max_ma:.0f} mA, or {args.pull_max_mm:.0f} mm. It records where the tip goes: a few minutes.\n"
@@ -567,7 +855,7 @@ def cmd_explore(cfg, args):
         cables.calib = {**cables.calib, "pull_max_mm": [args.pull_max_mm if s else 0.0 for s in calib["pull_sign"]]}
         display.lines = ["exploring the workspace...  q = stop"]
         wmap = explore(cables, vision, display.show, args.pull_max_mm, step_mm=args.step_mm, max_load_ma=args.max_ma,
-                       only_motors=args.only)
+                       only_motors=args.only, push=args.push)
         display.region = (wmap.outline(), wmap.rest[1])
         display.lines = [f"reachable area (green): up to {wmap.reach_mm():.0f} mm from the middle"]
         hold({"vision": vision, "display": display}, 4.0)

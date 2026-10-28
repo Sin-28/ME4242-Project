@@ -220,7 +220,7 @@ def cmd_calibrate(cfg, args):
             print("Could not connect to the motors (power on? USB plugged in? EMIO Labs closed?).")
             return
         calibrate(cables, vision, display.show, first_direction=args.first_direction,
-                  pull_signs=args.pull_signs, search_mm=args.search_mm)
+                  pull_signs=args.pull_signs, search_mm=args.search_mm, push=args.push)
         print("Calibration done.")
     except KeyboardInterrupt:
         print("Stopped.")
@@ -529,6 +529,9 @@ def cmd_search(cfg, args):
 # ---------------------------------------------------------------- jog
 
 def cmd_jog(cfg, args):
+    if args.teach:
+        from nus_retrieve import cmd_teach
+        return cmd_teach(cfg, args)
     print("Wind each cable by keyboard to take up slack or to find which direction pulls.\n"
           "In the camera window: 0-3 select a motor | w / s = +1 / -1 mm | W / S = +5 / -5 mm | q quit.\n"
           "A cable is just taut when the tip starts to move. Note for each motor whether + or - tightened it.")
@@ -644,15 +647,22 @@ def main():
     p_chk.add_argument("--apply", action="store_true", help="save the measured stage height to nus_config.json")
     p_chk.add_argument("--letter-mm", type=float, default=5.0, help="letter thickness in mm (default 5)")
     sub.add_parser("detect", help="camera only: show detections, teach letter shapes")
-    sub.add_parser("jog", help="wind cables by keyboard: take up slack, find pull directions")
+    p_jog = sub.add_parser("jog", help="wind cables by keyboard: take up slack, find pull directions")
+    p_jog.add_argument("--teach", action="store_true",
+                       help="teach the holder: drive each letter into its slot by keyboard and save the cable "
+                            "poses (n / u / s); `retrieve` replays them")
     p_cal = sub.add_parser("calibrate", help="find cable directions/taut points and measure the model")
     p_cal.add_argument("--first-direction", type=int, choices=(-1, 1), default=-1,
                        help="direction to try first when searching for each cable's pull direction")
     p_cal.add_argument("--pull-signs", type=parse_pull_signs, default=None,
                        help="known pull direction per motor, e.g. --pull-signs=-1,-1,1,1 (only that "
                             "direction is searched, so no cable is unwound)")
-    p_cal.add_argument("--search-mm", type=float, default=30.0,
-                       help="how much cable to turn while looking for the taut point (default 30, max 100)")
+    p_cal.add_argument("--push", type=parse_motors, default=(), metavar="M0[,M1]",
+                       help="motors whose side is blocked by an obstacle near the rest pose (needs --pull-signs): "
+                            "accept them once taut and measure them by pulling up to 30 mm, through the obstacle")
+    p_cal.add_argument("--search-mm", type=float, default=50.0,
+                       help="how much cable to turn while looking for the taut point (default 50, max 100): "
+                            "a cable can gather this much slack while the motors are off")
     p_go = sub.add_parser("goto", help="steer the tip over a letter")
     p_go.add_argument("letter", type=str.upper, choices=(*LETTERS, "ALL"))
     p_go.add_argument("--dry-run", action="store_true", help="detect and plan only, never move")
@@ -692,8 +702,11 @@ def main():
     p_x.add_argument("--step-mm", type=float, default=5.0, help="grid step of the pulls (default 5)")
     p_x.add_argument("--max-ma", type=float, default=1500.0,
                      help="safety: stop pulling when a motor's current rises by this much (mA, default 1500)")
-    p_x.add_argument("--only", type=lambda t: [int(v.strip().upper().lstrip("M")) for v in t.split(",")], default=None,
+    p_x.add_argument("--only", type=parse_motors, default=None,
                      metavar="M1[,M2]", help="explore again only the cable pairs with these motors, keep the rest of the map")
+    p_x.add_argument("--push", type=parse_motors, default=(), metavar="M0[,M1]",
+                     help="keep pulling these motors when the tip stops moving (pressed on an obstacle), up to "
+                          "--max-ma / --pull-max-mm")
     p_r = sub.add_parser("retrieve", help="pick the letters up and put them in the holder, trying other routes "
                                           "when the tip gets stuck")
     p_r.add_argument("--dry-run", action="store_true", help="camera only: show the plan, motors never move")
@@ -715,8 +728,12 @@ def main():
     p_r.add_argument("--attempt-timeout-s", type=float, default=60.0, help="give up an attempt after this long (default 60 s)")
     p_r.add_argument("--max-attempts", type=int, default=5, help="attempts per letter per round (default 5)")
     p_r.add_argument("--place-tries", type=int, default=3, help="routes tried to the slot while carrying (default 3)")
-    p_r.add_argument("--carry-margin-mm", type=float, default=12.0,
-                     help="extra gap from obstacles while carrying a letter (default 12)")
+    p_r.add_argument("--carry-margin-mm", type=float, default=5.0,
+                     help="gap kept between the carried letter (its measured outline) and obstacles (default 5)")
+    p_r.add_argument("--yaw-tol-deg", type=float, default=20.0,
+                     help="warn when a letter is turned more than this from its slot (default 20)")
+    p_r.add_argument("--touch-height-mm", type=float, default=12.0,
+                     help="tip more than this above touching a magnet = it can't reach down there (default 12)")
     p_r.add_argument("--slot-tol-mm", type=float, default=15.0, help="letter this close to its slot = placed (default 15)")
     p_r.add_argument("--waypoint-step-mm", type=float, default=15.0, help="spacing of the route's points (default 15)")
     p_r.add_argument("--record", action="store_true", help="save the camera view as an MP4 in runs/")
@@ -748,6 +765,16 @@ def parse_pull_signs(text):
         raise argparse.ArgumentTypeError("give four values of -1, 1 (or 0 = motor unused), "
                                          "e.g. --pull-signs=0,-1,1,1")
     return signs
+
+
+def parse_motors(text):
+    try:
+        motors = [int(v.strip().upper().lstrip("M")) for v in text.split(",")]
+    except ValueError:
+        motors = []
+    if not motors or any(m not in range(4) for m in motors):
+        raise argparse.ArgumentTypeError("give motor numbers 0-3, e.g. M0 or M0,M1")
+    return motors
 
 
 if __name__ == "__main__":
