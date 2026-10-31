@@ -6,3 +6,6 @@ runs/
 test_output/
 snapshot_*.png
 workspace_map.json
+
+# local motor movement recordings
+motion_*.json
